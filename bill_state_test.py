@@ -24,6 +24,7 @@ from navigate_bill import (
     SessionRecoveryFailed,
     MAX_SIGN_IN_RETRIES,
     navigate_pay_bill,
+    _account_number_needs_fix,
 )
 from guardrail import check_session_expired_tap_allowed
 import dump_screen
@@ -129,6 +130,42 @@ AMBIGUOUS_CASES = [
     ),
 ]
 
+ACCOUNT_NUMBER_FIX_CASES = [
+    # (description, elements, account_number, expected)
+    (
+        "single EditText already matches - nothing to fix",
+        [{"label": "0225305397", "clickable": True, "class": "android.widget.EditText",
+          "nearby_label": None, "bounds": "[176,448][810,538]", "is_password": False}],
+        "0225305397",
+        False,
+    ),
+    (
+        "single EditText shows the wrong value - needs fixing",
+        [{"label": "0100000000", "clickable": True, "class": "android.widget.EditText",
+          "nearby_label": None, "bounds": "[176,448][810,538]", "is_password": False}],
+        "0225305397",
+        True,
+    ),
+    (
+        "zero EditText fields - nothing to fix, refuse to guess",
+        [{"label": "Network Operator\nWE", "clickable": True, "class": "android.view.View",
+          "nearby_label": None, "bounds": "[47,603][1033,750]", "is_password": False}],
+        "0225305397",
+        False,
+    ),
+    (
+        "two EditText fields - ambiguous, refuse to guess",
+        [
+            {"label": "0100000000", "clickable": True, "class": "android.widget.EditText",
+             "nearby_label": None, "bounds": "[0,0][10,10]", "is_password": False},
+            {"label": "9999", "clickable": True, "class": "android.widget.EditText",
+             "nearby_label": None, "bounds": "[0,10][10,20]", "is_password": False},
+        ],
+        "0225305397",
+        False,
+    ),
+]
+
 
 def run():
     failures = 0
@@ -150,6 +187,14 @@ def run():
         except RuntimeError as e:
             print(f"PASS  {description}")
             print(f"      raised RuntimeError as expected: {e}")
+
+    for description, elements, account_number, expected in ACCOUNT_NUMBER_FIX_CASES:
+        actual = _account_number_needs_fix(elements, account_number)
+        status = "PASS" if actual == expected else "FAIL"
+        if status == "FAIL":
+            failures += 1
+        print(f"{status}  _account_number_needs_fix: {description}")
+        print(f"      expected={expected!r} actual={actual!r}")
 
     # Sign-in screen: parsed from a real recorded XML dump, not a
     # hand-typed snapshot - catches drift in dump_screen.py's own
@@ -647,7 +692,7 @@ def run():
         raised = False
         try:
             navigate_pay_bill(
-                service_tile_label="Landline", operator="WE",
+                service_tile_label="Landline", operator="WE", account_number="0225305397",
                 known_values={"leaked": "totally-fake-test-password"},
             )
         except AssertionError:
@@ -671,7 +716,8 @@ def run():
     total = (len(CASES) + len(AMBIGUOUS_CASES) + len(SESSION_EXPIRED_CASES)
               + len(checks) + len(ADB_FAILURE_CASES) + len(STABILITY_CASES)
               + len(FEE_SUMMARY_CASES) + len(RECOVERY_CHECKS)
-              + len(FREE_CHOICE_AI_CASES) + len(FREE_CHOICE_TAP_CASES) + 1)
+              + len(FREE_CHOICE_AI_CASES) + len(FREE_CHOICE_TAP_CASES)
+              + len(ACCOUNT_NUMBER_FIX_CASES) + 1)
     print(f"\n{total - failures}/{total} passed")
     return failures == 0
 

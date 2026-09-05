@@ -1,0 +1,63 @@
+name: Pay Bill
+
+# Runs on a self-hosted runner only - see the deployment plan. That
+# runner is expected to be a persistent machine with the Android
+# emulator already running, Sahl already installed and signed in
+# (SIGN_IN_SCREEN_MARKER's recovery path only ever taps "Sign in", it
+# never types credentials into a fresh install), and `adb` on PATH.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"  # daily at 08:00 UTC - adjust to taste
+  workflow_dispatch:
+    inputs:
+      service_tile_label:
+        description: "Home-screen tile to tap (e.g. Internet, Landline)"
+        required: false
+        default: "Internet"
+      operator:
+        description: "Operator/company to pick in the Network Operator dropdown"
+        required: false
+        default: "WE"
+      account_number:
+        description: "Account/phone number the Pay Bill form should show"
+        required: false
+        default: "0225305397"
+
+jobs:
+  pay-bill:
+    runs-on: [self-hosted, linux]
+    env:
+      SAHL_PASSWORD: ${{ secrets.SAHL_PASSWORD }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      BILL_SERVICE_TILE_LABEL: ${{ github.event.inputs.service_tile_label || 'Internet' }}
+      BILL_OPERATOR: ${{ github.event.inputs.operator || 'WE' }}
+      BILL_ACCOUNT_NUMBER: ${{ github.event.inputs.account_number || '0225305397' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the regression test suite first
+        run: python bill_state_test.py
+
+      - name: Confirm exactly one adb device is attached
+        run: |
+          count=$(adb devices | grep -c "	device$")
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly one attached adb device, found $count."
+            adb devices
+            exit 1
+          fi
+
+      - name: Run the bill-pay flow
+        run: python navigate_bill.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bill-fee-results
+          path: results/*.json
+          if-no-files-found: ignore

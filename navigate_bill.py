@@ -8,8 +8,9 @@ Mobile Top-Up, confirmed by hand for Internet:
      it explicitly anyway rather than rely on the default, then tap
      Proceed
   -> Pay Bill form: an account/phone number field (pre-filled with a
-     saved default - left as-is, we don't type over it) and a
-     "Network Operator" field that opens a company-picker dropdown
+     saved default - checked against the intended account_number and
+     re-typed if it doesn't match, see _account_number_needs_fix())
+     and a "Network Operator" field that opens a company-picker dropdown
      (WE / Etisalat / Orange / Nour, for Internet) - tap it open, pick
      the company, tap Proceed inside the dropdown, then tap Enquire
   -> Enquiry screen: the due amount in a single editable EGP field,
@@ -40,6 +41,7 @@ once you've seen them for real.
 """
 
 import os
+import sys
 import time
 
 from dotenv import load_dotenv
@@ -99,6 +101,13 @@ WAIT_FOR_LIVE_CALC_SECONDS = 0.5
 # own before the actual bill flow even starts.
 MAX_STEPS = 20
 MAX_SIGN_IN_RETRIES = 3
+# Without a dedicated cap, a value that never ends up matching (e.g. the
+# app silently reformats what you type) would silently burn the whole
+# shared MAX_STEPS budget with no specific diagnostic, since the
+# account-number-fix branch always `continue`s before reaching the
+# loop's own "stuck" detector at the bottom - same reasoning as
+# navigate.py's MAX_FORM_ATTEMPTS.
+MAX_ACCOUNT_NUMBER_ATTEMPTS = 2
 
 
 def _labels(elements):
@@ -108,6 +117,17 @@ def _labels(elements):
 def _looks_like_fee_screen(all_labels):
     normalized = {label.rstrip(":").strip() for label in all_labels if label}
     return any(key in normalized for key in FEE_SCREEN_KEYS)
+
+
+def _account_number_needs_fix(elements, account_number: str) -> bool:
+    """True only when there's exactly one EditText on screen and its
+    current value doesn't already match account_number. Zero or
+    multiple EditText fields return False ("nothing to fix here") -
+    this deliberately never guesses which field is the account number;
+    clear_and_type_field's own single-field refusal logic is a second,
+    independent line of defense if this is ever reached ambiguously."""
+    fields = [e for e in elements if e["class"] == "android.widget.EditText"]
+    return len(fields) == 1 and fields[0]["label"] != account_number
 
 
 def determine_bill_screen_state(all_labels: list[str], operator_confirmed: bool) -> str | None:
@@ -269,6 +289,7 @@ def attempt_session_recovery(all_labels: list[str], sign_in_state: dict) -> bool
 def navigate_pay_bill(
     service_tile_label: str,
     operator: str,
+    account_number: str,
     tiers=None,
     max_steps: int = MAX_STEPS,
     known_values: dict | None = None,
@@ -279,15 +300,26 @@ def navigate_pay_bill(
     guardrail.ALLOWED_LABELS - this function only taps labels that are
     already approved, it doesn't add any.
 
-    known_values: extra task-relevant values (e.g. a future flow's
-    account number) the free-choice AI fallback tier (see below) may
-    type into a field it judges relevant - always merged with
-    {"service_tile_label": ..., "operator": ...}. NEVER put
-    SAHL_PASSWORD's value in here - asserted below, not just documented."""
+    account_number: the value the account/phone-number field on the Pay
+    Bill form should show. The field comes pre-filled with some saved
+    default - this is checked against it every step and re-typed if it
+    doesn't match (see _account_number_needs_fix()), rather than
+    trusting the default is always correct.
+
+    known_values: extra task-relevant values the free-choice AI fallback
+    tier (see below) may type into a field it judges relevant - always
+    merged with {"service_tile_label": ..., "operator": ...,
+    "account_number": ...}. NEVER put SAHL_PASSWORD's value in here -
+    asserted below, not just documented."""
 
     if known_values is None:
         known_values = {}
-    known_values = {"service_tile_label": service_tile_label, "operator": operator, **known_values}
+    known_values = {
+        "service_tile_label": service_tile_label,
+        "operator": operator,
+        "account_number": account_number,
+        **known_values,
+    }
     if SAHL_PASSWORD is not None:
         assert SAHL_PASSWORD not in known_values.values(), (
             "known_values must never include SAHL_PASSWORD's value - the free-choice "
@@ -308,6 +340,10 @@ def navigate_pay_bill(
     # just reopens the dropdown, re-picks the same operator, and
     # closes it forever without ever reaching Enquire.
     operator_confirmed = False
+
+    # Counts how many times the account-number-fix branch below has
+    # fired this run - see MAX_ACCOUNT_NUMBER_ATTEMPTS.
+    account_number_attempts = 0
 
     # See attempt_session_recovery's docstring for what this tracks and
     # why it has to be caller-owned rather than hidden inside that
@@ -353,6 +389,30 @@ def navigate_pay_bill(
             continue
 
         state = determine_bill_screen_state(all_labels, operator_confirmed)
+
+        # 1.5 Pay Bill form's account/phone-number field - checked
+        #     whenever the underlying form is visible with the dropdown
+        #     CLOSED (the field is covered by a modal Scrim while
+        #     "company-picker" is open, so this deliberately excludes
+        #     that state - see determine_bill_screen_state's docstring).
+        if state in ("operator-dropdown-needed", "account-form-ready") and \
+                _account_number_needs_fix(elements, account_number):
+            account_number_attempts += 1
+            if account_number_attempts > MAX_ACCOUNT_NUMBER_ATTEMPTS:
+                print(f"Account number field still doesn't show {account_number!r} "
+                      f"after {account_number_attempts - 1} attempts to fix it - "
+                      f"stopping rather than repeating the same thing forever.")
+                return None
+            print(f"Account number field doesn't show {account_number!r} yet - "
+                  f"filling it in (attempt {account_number_attempts}).")
+            filled = clear_and_type_field(account_number, xml_path=xml_path)
+            if not filled:
+                print("Could not fill in the account number field - stopping.")
+                return None
+            time.sleep(1.0)
+            dismiss_keyboard()
+            time.sleep(0.5)
+            continue
 
         # 2. "Select service type" screen - choose Pay Bill (the one
         #    hand-verified exception to the deny pattern), then Proceed
@@ -510,15 +570,23 @@ def navigate_pay_bill(
     return None
 
 
-def navigate_landline_bill(operator: str = "WE", tiers=None, max_steps: int = MAX_STEPS):
+def navigate_landline_bill(
+    account_number: str, operator: str = "WE", tiers=None, max_steps: int = MAX_STEPS
+):
     """Landline's Pay Bill flow - confirmed by hand to be the exact same
     shape as Internet's, just starting from the "Landline" home-screen
     tile instead of "Internet". Thin wrapper around navigate_pay_bill()
     rather than a separate implementation, since nothing about the
-    steps themselves differs."""
+    steps themselves differs.
+
+    account_number has to come before operator here (Python requires
+    non-default params before defaulted ones) - the reverse of its
+    position in navigate_pay_bill itself, which has no such
+    constraint."""
 
     return navigate_pay_bill(
-        service_tile_label="Landline", operator=operator, tiers=tiers, max_steps=max_steps
+        service_tile_label="Landline", operator=operator, account_number=account_number,
+        tiers=tiers, max_steps=max_steps,
     )
 
 
@@ -597,14 +665,23 @@ if __name__ == "__main__":
     # (called from inside navigate_pay_bill's own call stack) as well as
     # navigate_pay_bill() itself, so this one wrap covers both without
     # needing a separate try/except inside either function.
+    # Defaults match the values verified by hand; a GitHub Actions
+    # workflow_dispatch run can override any of these via env vars set
+    # from its own inputs, without changing the defaults for a plain
+    # local `python navigate_bill.py` run.
+    SERVICE_TILE_LABEL = os.environ.get("BILL_SERVICE_TILE_LABEL", "Internet")
+    OPERATOR = os.environ.get("BILL_OPERATOR", "WE")
+    TEST_ACCOUNT_NUMBER = os.environ.get("BILL_ACCOUNT_NUMBER", "0225305397")
     try:
-        results = navigate_pay_bill(service_tile_label="Internet", operator="WE")
+        results = navigate_pay_bill(
+            service_tile_label=SERVICE_TILE_LABEL, operator=OPERATOR, account_number=TEST_ACCOUNT_NUMBER,
+        )
     except AdbConnectionError as e:
         print(f"\nadb connection lost - stopping this run. ({e})")
         print("(Future: automatic emulator recovery goes here.)")
         results = None
 
-    print("\n=== Final Results (Internet, Pay Bill, WE) ===")
+    print(f"\n=== Final Results ({SERVICE_TILE_LABEL}, Pay Bill, {OPERATOR}) ===")
     if isinstance(results, list):
         for row in results:
             print(row)
@@ -612,3 +689,4 @@ if __name__ == "__main__":
         print(results)
     else:
         print("No results - navigation did not complete successfully.")
+        sys.exit(1)
