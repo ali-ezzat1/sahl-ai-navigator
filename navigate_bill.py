@@ -1,0 +1,614 @@
+"""
+Step 7: navigate Sahl's "Pay Bill" flow - a different shape from
+Mobile Top-Up, confirmed by hand for Internet:
+
+  Home -> tap the service tile (e.g. "Internet")
+  -> "Select service type" screen: radio options (Pay Bill / Top-Up /
+     Extra Packages), with Pay Bill pre-selected by default - we tap
+     it explicitly anyway rather than rely on the default, then tap
+     Proceed
+  -> Pay Bill form: an account/phone number field (pre-filled with a
+     saved default - left as-is, we don't type over it) and a
+     "Network Operator" field that opens a company-picker dropdown
+     (WE / Etisalat / Orange / Nour, for Internet) - tap it open, pick
+     the company, tap Proceed inside the dropdown, then tap Enquire
+  -> Enquiry screen: the due amount in a single editable EGP field,
+     with Service Value / Service Fees / Total Amount computed live
+     underneath - same live-recompute behavior as Mobile's amount
+     screen, but ONE field here instead of two. Unlike Mobile's flat
+     2.5 EGP fee, Internet's fee here scales with the amount (roughly
+     4.6% on the default due amount), so sweeping different typed
+     amounts is worth doing here too - see collect_bill_fee_tiers().
+
+We never tap "Pay X EGP" or "Pay All" - guardrail.py's DENY_PATTERN
+blocks both no matter what. The one deliberate, hand-verified
+exception is "Pay Bill" itself, which is a category radio button, not
+a checkout action - see BILL_CATEGORY_DENY_OVERRIDE in guardrail.py
+for the reasoning.
+
+Internet's Pay Bill flow has been walked and verified by hand. Landline
+has now been confirmed to follow the exact same shape (tile -> Select
+service type -> Pay Bill -> Proceed -> company picker -> Enquire),
+with "WE" as its operator - see navigate_landline_bill() below.
+
+Electricity/Water/Gas show the same home-screen tile grid and
+plausibly share this same shape too, but that's still a guess, not a
+confirmation - walk one by hand first (same as every other flow in
+this project) before pointing navigate_pay_bill() at it, and add its
+tile label + operator/company names to guardrail.ALLOWED_LABELS only
+once you've seen them for real.
+"""
+
+import os
+import time
+
+from dotenv import load_dotenv
+
+from dump_screen import dump_screen_until_labeled, AdbConnectionError
+from launch_sahl import ensure_sahl_open
+from tap import (
+    safe_tap,
+    safe_tap_recovery,
+    safe_tap_session_expired_dialog,
+    safe_tap_bill_category,
+    safe_tap_by_prefix,
+    safe_tap_first_present,
+    fill_sign_in_form,
+    ai_free_choice_tap,
+    ai_free_choice_type,
+    dismiss_keyboard,
+    clear_and_type_field,
+)
+from navigate import extract_fee_summary, SIGN_IN_SCREEN_MARKER
+from ai_pick import suggest_relabel, classify_screen_and_pick_action, ask_ai_free_choice
+from guardrail import ALLOWED_LABELS, ACTION_SYNONYMS, SESSION_EXPIRED_MARKER_TEXT
+
+load_dotenv()
+
+# The account's own login phone number - a fixed credential, not a
+# per-call flow parameter like service_tile_label/operator below. The
+# password is deliberately NOT hardcoded here - add SAHL_PASSWORD to
+# .env yourself (same style as the existing GEMINI_API_KEY line):
+#   SAHL_PASSWORD = "your_actual_password"
+SIGN_IN_PHONE_NUMBER = "01111198404"
+SAHL_PASSWORD = os.environ.get("SAHL_PASSWORD")
+
+SERVICE_TYPE_MARKER = "Select service type"
+PAY_BILL_OPTION = "Pay Bill"
+PROCEED = "Proceed"
+ENQUIRE = "Enquire"
+CHOOSE_COMPANY_MARKER = "Choose Company"
+NETWORK_OPERATOR_PREFIX = "Network Operator"
+FEE_SCREEN_KEYS = ("Service Value", "Service Fees", "Total Amount")
+
+# The closed set of states determine_bill_screen_state() can return.
+# Also doubles as the taxonomy handed to the AI fallback classifier
+# (plus "unknown") so there's exactly one place that names these states.
+BILL_SCREEN_STATES = [
+    "service-type-select",
+    "company-picker",
+    "operator-dropdown-needed",
+    "account-form-ready",
+    "fee-confirmation",
+]
+
+DEFAULT_TIERS = [50, 100, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000]
+WAIT_FOR_LIVE_CALC_SECONDS = 0.5
+# Bumped from 12: session recovery (dismiss dialog + fill sign-in form
+# + up to MAX_SIGN_IN_RETRIES wait-retries) can now eat 5+ steps on its
+# own before the actual bill flow even starts.
+MAX_STEPS = 20
+MAX_SIGN_IN_RETRIES = 3
+
+
+def _labels(elements):
+    return [e["label"] for e in elements if e["label"]]
+
+
+def _looks_like_fee_screen(all_labels):
+    normalized = {label.rstrip(":").strip() for label in all_labels if label}
+    return any(key in normalized for key in FEE_SCREEN_KEYS)
+
+
+def determine_bill_screen_state(all_labels: list[str], operator_confirmed: bool) -> str | None:
+    """Pure function: given what's currently visible, plus the one
+    piece of state the screen itself can't reveal (operator_confirmed
+    - see navigate_pay_bill's docstring for why), figure out which
+    known state of the bill flow this is. Returns one of
+    BILL_SCREEN_STATES, or None if nothing recognized (caller should
+    fall back to the AI classifier).
+
+    Evaluates EVERY condition rather than stopping at the first match,
+    and treats more than one matching at once as a bug in the state
+    definitions themselves - not something to silently pick a winner
+    for by code order. That's deliberate: silently taking "whichever
+    branch happened to come first" is exactly the kind of bug that's
+    painful to trace after the fact; raising immediately, with the
+    exact labels that caused it, is not.
+
+    operator_confirmed is what keeps "operator-dropdown-needed" and
+    "account-form-ready" mutually exclusive even though both can be
+    visible on screen at once (the Network Operator field shows its
+    pre-set default AND the submit button can already be present,
+    before we've explicitly re-confirmed the operator this run).
+
+    The company-picker dropdown is a modal overlay (see the "Scrim"
+    element that appears alongside it) - the underlying form's own
+    labels (the Network Operator field, the submit button) can still
+    be present in the tree while it's open, just visually covered. So
+    both underlying-form states are also gated on the dropdown NOT
+    being open, confirmed against a real run: ['Network Operator',
+    'Choose Company', 'WE', 'Proceed', 'Scrim'] was reported as both
+    "company-picker" and "operator-dropdown-needed" before this guard
+    was added - see bill_state_test.py."""
+
+    matches = []
+
+    company_picker_open = CHOOSE_COMPANY_MARKER in all_labels
+
+    if SERVICE_TYPE_MARKER in all_labels:
+        matches.append("service-type-select")
+
+    if company_picker_open:
+        matches.append("company-picker")
+
+    network_operator_visible = any(
+        label.startswith(NETWORK_OPERATOR_PREFIX) for label in all_labels
+    )
+    if not company_picker_open and not operator_confirmed and network_operator_visible:
+        matches.append("operator-dropdown-needed")
+
+    submit_button_visible = bool(ACTION_SYNONYMS["submit_bill_form"] & set(all_labels))
+    if not company_picker_open and operator_confirmed and submit_button_visible:
+        matches.append("account-form-ready")
+
+    if _looks_like_fee_screen(all_labels):
+        matches.append("fee-confirmation")
+
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Ambiguous bill-screen state: more than one state matched at once "
+            f"({matches}). This means two state conditions in "
+            f"determine_bill_screen_state overlap and need to be made mutually "
+            f"exclusive - fix the function, don't silently pick one. "
+            f"Labels seen: {all_labels}"
+        )
+
+    return matches[0] if matches else None
+
+
+class SessionRecoveryFailed(Exception):
+    """Raised by attempt_session_recovery when recovery itself could not
+    be completed (SAHL_PASSWORD missing, the sign-in form couldn't be
+    filled even after a retry, or still stuck on the sign-in screen
+    after MAX_SIGN_IN_RETRIES). Callers decide what "give up" means in
+    their own context - navigate_pay_bill stops the whole run,
+    collect_bill_fee_tiers skips just the one tier being measured."""
+
+
+def attempt_session_recovery(all_labels: list[str], sign_in_state: dict) -> bool:
+    """Checks for and handles the two session-recovery conditions
+    shared by navigate_pay_bill's main loop and collect_bill_fee_tiers'
+    tier sweep: the merged "Session Expired" dialog, and the sign-in
+    screen. Returns True if a recovery action (or a retry-wait) was
+    taken - the caller should treat the screen as having just changed
+    and re-dump/re-check from the top rather than proceeding with the
+    all_labels it already has. Returns False if neither condition
+    applies - there's nothing to recover from, proceed normally.
+
+    Raises SessionRecoveryFailed if recovery could not be completed -
+    see that exception's docstring for what each caller does with it.
+
+    sign_in_state is a small mutable dict the CALLER owns and passes in
+    each time - {"attempted": bool, "retry_count": int} - keeps this
+    function itself stateless while still tracking progress across a
+    caller's own loop iterations. Give each independent loop its OWN
+    sign_in_state dict, starting fresh: a session expiry detected
+    midway through collect_bill_fee_tiers is definitionally a NEW one
+    relative to whatever navigate_pay_bill already recovered from to
+    get there, so it should start its own attempted/retry tracking at
+    zero, not inherit navigate_pay_bill's."""
+
+    if any(label and SESSION_EXPIRED_MARKER_TEXT in label for label in all_labels):
+        print("Session expired dialog detected - dismissing it.")
+        safe_tap_session_expired_dialog()
+        # a fresh expiry always means a fresh sign-in attempt is needed,
+        # even if this caller had already signed in successfully before
+        sign_in_state["attempted"] = False
+        sign_in_state["retry_count"] = 0
+        time.sleep(1.5)
+        return True
+
+    if SIGN_IN_SCREEN_MARKER not in all_labels:
+        return False
+
+    if sign_in_state["attempted"]:
+        # Already filled and submitted the form once but we're STILL
+        # seeing the sign-in screen - most likely just a slow
+        # transition after a real login (a mid-transition dump caught a
+        # few hundred ms after tapping Sign in briefly reported ZERO
+        # EditText fields while the screen was navigating away, before
+        # this tracking existed), not a reason to re-fill. Wait and
+        # re-check instead.
+        if sign_in_state["retry_count"] >= MAX_SIGN_IN_RETRIES:
+            raise SessionRecoveryFailed(
+                f"still on the sign-in screen after {MAX_SIGN_IN_RETRIES} retries "
+                f"post-submit - check SAHL_PASSWORD in .env, or whether sign-in is "
+                f"failing for some other reason"
+            )
+        sign_in_state["retry_count"] += 1
+        print(f"Still on the sign-in screen after submitting it - waiting to see "
+              f"if this is just a slow transition (retry "
+              f"{sign_in_state['retry_count']}/{MAX_SIGN_IN_RETRIES}).")
+        time.sleep(3.0)
+        return True
+
+    if SAHL_PASSWORD is None:
+        raise SessionRecoveryFailed(
+            "SAHL_PASSWORD is not set in .env - can't fill in the sign-in form"
+        )
+
+    print("Landed on the sign-in screen - filling in phone number and password.")
+    filled = fill_sign_in_form(SIGN_IN_PHONE_NUMBER, SAHL_PASSWORD)
+    if not filled:
+        print("Could not fill in the sign-in form - retrying once after a short wait.")
+        time.sleep(2.0)
+        filled = fill_sign_in_form(SIGN_IN_PHONE_NUMBER, SAHL_PASSWORD)
+    if not filled:
+        raise SessionRecoveryFailed("could not fill in the sign-in form, even after a retry")
+
+    time.sleep(0.5)
+    print("Tapping Sign in.")
+    safe_tap_recovery("Sign in")
+    sign_in_state["attempted"] = True
+    print("Waiting for sign-in to finish loading...")
+    time.sleep(4.0)
+    return True
+
+
+def navigate_pay_bill(
+    service_tile_label: str,
+    operator: str,
+    tiers=None,
+    max_steps: int = MAX_STEPS,
+    known_values: dict | None = None,
+):
+    """service_tile_label: the home-screen tile to tap first (e.g.
+    "Internet"). operator: which company to pick in the Network
+    Operator dropdown (e.g. "WE"). Both must already be verified and on
+    guardrail.ALLOWED_LABELS - this function only taps labels that are
+    already approved, it doesn't add any.
+
+    known_values: extra task-relevant values (e.g. a future flow's
+    account number) the free-choice AI fallback tier (see below) may
+    type into a field it judges relevant - always merged with
+    {"service_tile_label": ..., "operator": ...}. NEVER put
+    SAHL_PASSWORD's value in here - asserted below, not just documented."""
+
+    if known_values is None:
+        known_values = {}
+    known_values = {"service_tile_label": service_tile_label, "operator": operator, **known_values}
+    if SAHL_PASSWORD is not None:
+        assert SAHL_PASSWORD not in known_values.values(), (
+            "known_values must never include SAHL_PASSWORD's value - the free-choice "
+            "AI fallback tier has no typing access to the password under any "
+            "circumstance; use fill_sign_in_form for that field instead."
+        )
+
+    if not ensure_sahl_open():
+        print("Could not get Sahl open from the Android launcher - stopping.")
+        return None
+
+    previous_signature = None
+    # the Network Operator field shows a label like "Network
+    # Operator\nWE" EVEN BEFORE we've touched it - WE is a pre-set
+    # default, same as the phone number field. So the screen alone
+    # can't tell "already confirmed this run" from "still showing the
+    # untouched default" - we have to track it ourselves, or the loop
+    # just reopens the dropdown, re-picks the same operator, and
+    # closes it forever without ever reaching Enquire.
+    operator_confirmed = False
+
+    # See attempt_session_recovery's docstring for what this tracks and
+    # why it has to be caller-owned rather than hidden inside that
+    # function.
+    sign_in_state = {"attempted": False, "retry_count": 0}
+
+    # Gates the free-choice AI fallback tier (tier 3, see below): once
+    # we've ever reached the fee/enquiry screen this run, that tier is
+    # permanently disabled for the rest of the run - confines it to the
+    # lower-stakes navigational part of the flow, keeps everything at
+    # and after the fee screen exactly as strict as it's always been.
+    fee_confirmation_reached = False
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- Bill-flow step {step} ---")
+        # dump_screen_until_labeled instead of a plain dump: waits out
+        # loading transitions (network calls after Enquire/submit, sign-
+        # in redirects, etc.) instead of catching a blank screen and
+        # falling straight through to "unrecognized" - see its docstring.
+        xml_path, elements = dump_screen_until_labeled()
+        all_labels = _labels(elements)
+
+        # session recovery - checked FIRST, before anything else, since
+        # this can interrupt the flow at any point, not just one screen
+        # (same reasoning as navigate.py's identical check).
+        try:
+            if attempt_session_recovery(all_labels, sign_in_state):
+                continue
+        except SessionRecoveryFailed as e:
+            print(f"Session recovery failed - stopping. ({e})")
+            return None
+
+        # 1. home screen - tap the service tile (only makes sense as
+        #    the very first thing we try). If it's not there, we don't
+        #    special-case anything here - just fall through to the
+        #    catch-all at the bottom, which already checks
+        #    service_tile_label (and every other known anchor) via
+        #    suggest_relabel before giving up.
+        if step == 1 and service_tile_label in all_labels:
+            print(f"Tapping the {service_tile_label!r} tile on the home screen.")
+            safe_tap(service_tile_label, xml_path)
+            time.sleep(1.5)
+            continue
+
+        state = determine_bill_screen_state(all_labels, operator_confirmed)
+
+        # 2. "Select service type" screen - choose Pay Bill (the one
+        #    hand-verified exception to the deny pattern), then Proceed
+        if state == "service-type-select":
+            if PAY_BILL_OPTION in all_labels:
+                print("Selecting 'Pay Bill'.")
+                safe_tap_bill_category(PAY_BILL_OPTION, xml_path)
+                time.sleep(1.0)
+            if PROCEED in all_labels:
+                print("Tapping Proceed.")
+                safe_tap(PROCEED, xml_path)
+                time.sleep(1.5)
+                continue
+            print("On the service-type screen but can't find Pay Bill/Proceed - stopping.")
+            return None
+
+        # 3a. company picker is open - pick the operator, then Proceed
+        if state == "company-picker":
+            if operator in all_labels:
+                print(f"Picking operator {operator!r} from the dropdown.")
+                safe_tap(operator, xml_path)
+                time.sleep(1.0)
+            if PROCEED in all_labels:
+                print("Tapping Proceed to close the dropdown.")
+                safe_tap(PROCEED, xml_path)
+                operator_confirmed = True
+                time.sleep(1.0)
+                continue
+            print("Company picker is open but can't find the operator/Proceed - stopping.")
+            return None
+
+        # 3b. Pay Bill form, operator not confirmed YET THIS RUN - open
+        #     the dropdown. Once operator_confirmed is True this state
+        #     won't fire again even though the field's label still
+        #     shows the same text - see determine_bill_screen_state.
+        if state == "operator-dropdown-needed":
+            print("Opening the Network Operator dropdown.")
+            opened = safe_tap_by_prefix(NETWORK_OPERATOR_PREFIX, xml_path)
+            if not opened:
+                return None
+            time.sleep(1.0)
+            continue
+
+        # 3c. Pay Bill form, operator already confirmed - submit it.
+        # Internet's form uses "Enquire" here; Landline's uses "Proceed"
+        # again instead (confirmed by hand) - safe_tap_first_present
+        # taps whichever already-approved member of the
+        # "submit_bill_form" synonym group is actually visible, instead
+        # of the code hardcoding one specific label per service.
+        if state == "account-form-ready":
+            print("Submitting the bill form.")
+            if not safe_tap_first_present("submit_bill_form", xml_path):
+                print("Could not submit the bill form - stopping.")
+                return None
+            time.sleep(2.0)
+            continue
+
+        # 4. Enquiry / amount screen
+        if state == "fee-confirmation":
+            # Set for defensive correctness / future-proofing: as this
+            # function is currently written, reaching this branch always
+            # returns immediately below, so tier 3 (further down) can
+            # never actually observe this flag True within THIS
+            # function's own loop today. It's still set here rather than
+            # relied on being unreachable, so it stays correct if a
+            # future change ever makes this branch NOT return right away.
+            fee_confirmation_reached = True
+            editable_fields = [e for e in elements if e["class"] == "android.widget.EditText"]
+            if editable_fields:
+                print("Reached the amount/fee screen - sweeping tiers now.")
+                return collect_bill_fee_tiers(tiers or DEFAULT_TIERS)
+            print("Reached a fee screen with no editable amount - reading it as-is.")
+            return extract_fee_summary(all_labels)
+
+        # Nothing in the deterministic table matched (state is None) -
+        # tier 2: ask the AI to classify the FULL screen and pick from
+        # the SAME allowlist-filtered candidates the deterministic path
+        # would have used. This can never expand what's tappable -
+        # `action` is still verified against `candidates` inside
+        # classify_screen_and_pick_action, so a wrong or hallucinated
+        # answer degrades to "nothing picked", never to an unapproved tap.
+        print("[FALLBACK] No known deterministic state matched here - asking the AI.")
+        candidates = sorted({
+            e["label"] for e in elements
+            if e["clickable"] and e["label"] in ALLOWED_LABELS
+        })
+        goal = (
+            f"Continue the {service_tile_label} Pay Bill flow (operator "
+            f"{operator!r}) toward the fee/enquiry screen."
+        )
+        classification = classify_screen_and_pick_action(
+            goal, all_labels, candidates, screen_types=BILL_SCREEN_STATES + ["unknown"]
+        )
+        print(f"[FALLBACK] AI's read on this screen: {classification['screen_type']!r}")
+        action = classification["action"]
+
+        if action is not None:
+            print(f"[FALLBACK] AI picked: {action!r}")
+            safe_tap(action)
+            time.sleep(1.5)
+            continue
+
+        # tier 3: free-choice AI fallback - only reached if tier 2 found
+        # nothing, AND only while fee_confirmation_reached is still
+        # False (see its comment above and navigate_bill.py's module
+        # docstring for the full safety reasoning). Can tap OR type
+        # anything currently visible, with no allowlist/deny-pattern
+        # check - an explicit, informed exception, not a default.
+        if not fee_confirmation_reached:
+            print("[FREE-CHOICE] Allowlist-constrained tiers found nothing - "
+                  "asking the AI to choose freely from the whole screen.")
+            free_choice = ask_ai_free_choice(goal, all_labels, elements, known_values)
+            print(f"[FREE-CHOICE] AI's choice: {free_choice}")
+
+            if free_choice["action_type"] == "tap":
+                acted = ai_free_choice_tap(
+                    free_choice["target_label"], goal=goal, all_labels=all_labels,
+                    reasoning=free_choice["reasoning"],
+                )
+                if acted:
+                    time.sleep(1.5)
+                    continue
+            elif free_choice["action_type"] == "type":
+                value = known_values[free_choice["value_key"]]
+                acted = ai_free_choice_type(
+                    free_choice["target_nearby_label"], free_choice["value_key"], value,
+                    goal=goal, all_labels=all_labels, reasoning=free_choice["reasoning"],
+                )
+                if acted:
+                    time.sleep(1.0)
+                    continue
+
+        # AI found nothing safe to do either - before giving up, ask it
+        # whether any of our known anchors for this flow might just
+        # have been renamed (never auto-tapped - see suggest_relabel's
+        # docstring, this is a suggestion for a human, not an action).
+        known_anchors = [
+            service_tile_label, SERVICE_TYPE_MARKER, PAY_BILL_OPTION, PROCEED,
+            ENQUIRE, CHOOSE_COMPANY_MARKER, operator, *FEE_SCREEN_KEYS,
+        ]
+        suggest_relabel(known_anchors, all_labels)
+
+        signature = tuple(all_labels)
+        if signature == previous_signature:
+            print("Screen didn't change after the last action - stopping rather than looping.")
+            print(f"  Labels seen: {all_labels}")
+            return None
+        previous_signature = signature
+
+        print("Unrecognized screen for the bill flow - stopping here.")
+        print(f"  Labels seen: {all_labels}")
+        return None
+
+    print("Ran out of steps without reaching the fee screen.")
+    return None
+
+
+def navigate_landline_bill(operator: str = "WE", tiers=None, max_steps: int = MAX_STEPS):
+    """Landline's Pay Bill flow - confirmed by hand to be the exact same
+    shape as Internet's, just starting from the "Landline" home-screen
+    tile instead of "Internet". Thin wrapper around navigate_pay_bill()
+    rather than a separate implementation, since nothing about the
+    steps themselves differs."""
+
+    return navigate_pay_bill(
+        service_tile_label="Landline", operator=operator, tiers=tiers, max_steps=max_steps
+    )
+
+
+MAX_RECOVERY_ATTEMPTS_PER_TIER = MAX_SIGN_IN_RETRIES + 3
+
+
+def _collect_one_tier(amount, sign_in_state: dict):
+    """Fills in one amount, reads back the fee breakdown, and returns
+    it as a row dict - or None if this tier should be skipped. Session
+    recovery is checked before typing AND before reading the result
+    (either point can catch a mid-sweep session expiry - see
+    attempt_session_recovery); either way, a successful recovery
+    retries this SAME tier from the top rather than silently losing the
+    data point, up to MAX_RECOVERY_ATTEMPTS_PER_TIER attempts."""
+
+    for _ in range(MAX_RECOVERY_ATTEMPTS_PER_TIER):
+        xml_path, elements = dump_screen_until_labeled()
+        all_labels = _labels(elements)
+        try:
+            if attempt_session_recovery(all_labels, sign_in_state):
+                continue  # recovered (or waiting) - re-check before doing anything
+        except SessionRecoveryFailed as e:
+            print(f"Could not recover session for {amount} EGP - skipping this tier. ({e})")
+            return None
+
+        filled = clear_and_type_field(str(amount), xml_path=xml_path)
+        if not filled:
+            print(f"Could not fill in {amount} EGP - skipping this tier.")
+            return None
+        dismiss_keyboard()
+        print("Waiting for the live fee calculation to update...")
+        time.sleep(WAIT_FOR_LIVE_CALC_SECONDS)
+
+        xml_path, elements = dump_screen_until_labeled()
+        all_labels = _labels(elements)
+        try:
+            if attempt_session_recovery(all_labels, sign_in_state):
+                print(f"Session needed recovery while reading {amount} EGP's "
+                      f"result - retrying this tier from the top.")
+                continue
+        except SessionRecoveryFailed as e:
+            print(f"Could not recover session while reading {amount} EGP - "
+                  f"skipping this tier. ({e})")
+            return None
+
+        summary = extract_fee_summary(all_labels)
+        if not summary:
+            print(f"No fee breakdown appeared for {amount} EGP - skipping this tier.")
+            return None
+        return {"Amount Requested": f"{amount} EGP", **summary}
+
+    print(f"Recovery took too many attempts for {amount} EGP - skipping this tier.")
+    return None
+
+
+def collect_bill_fee_tiers(tiers=DEFAULT_TIERS):
+    results = []
+    # Own local sign_in_state, independent of navigate_pay_bill's - by
+    # the time this function runs we're already past the original
+    # sign-in, so any expiry detected here is definitionally new and
+    # should start attempted/retry tracking fresh, not inherit state
+    # from whatever navigate_pay_bill already recovered from.
+    sign_in_state = {"attempted": False, "retry_count": 0}
+
+    for amount in tiers:
+        print(f"\n--- Testing amount: {amount} EGP ---")
+        row = _collect_one_tier(amount, sign_in_state)
+        if row is not None:
+            results.append(row)
+            print(f"  {row}")
+    return results
+
+
+if __name__ == "__main__":
+    # AdbConnectionError propagates up through collect_bill_fee_tiers()
+    # (called from inside navigate_pay_bill's own call stack) as well as
+    # navigate_pay_bill() itself, so this one wrap covers both without
+    # needing a separate try/except inside either function.
+    try:
+        results = navigate_pay_bill(service_tile_label="Internet", operator="WE")
+    except AdbConnectionError as e:
+        print(f"\nadb connection lost - stopping this run. ({e})")
+        print("(Future: automatic emulator recovery goes here.)")
+        results = None
+
+    print("\n=== Final Results (Internet, Pay Bill, WE) ===")
+    if isinstance(results, list):
+        for row in results:
+            print(row)
+    elif isinstance(results, dict):
+        print(results)
+    else:
+        print("No results - navigation did not complete successfully.")

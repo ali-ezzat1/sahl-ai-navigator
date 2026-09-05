@@ -1,0 +1,37 @@
+{
+  "collected_at": "2026-08-30T12:01:27.308303",
+  "results": {
+    "Vodafone": [
+      {
+        "Balance Requested": "50 EGP",
+        "Service Value": "71.43 EGP",
+        "Service Fees": "2.5 EGP",
+        "Total Amount": "73.93 EGP"
+      },
+      {
+        "Balance Requested": "100 EGP",
+        "Service Value": "142.86 EGP",
+        "Service Fees": "2.5 EGP",
+        "Total Amount": "145.36 EGP"
+      },
+      {
+        "Balance Requested": "200 EGP",
+        "Service Value": "285.72 EGP",
+        "Service Fees": "2.5 EGP",
+        "Total Amount": "288.22 EGP"
+      },
+      {
+        "Balance Requested": "300 EGP",
+        "Service Value": "428.58 EGP",
+        "Service Fees": "2.5 EGP",
+        "Total Amount": "431.08 EGP"
+      },
+      {
+        "Balance Requested": "350 EGP",
+        "Service Value": "500.0 EGP",
+        "Service Fees": "2.5 EGP",
+        "Total Amount": "502.5 EGP"
+      }
+    ]
+  }
+}
