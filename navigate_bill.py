@@ -40,9 +40,11 @@ tile label + operator/company names to guardrail.ALLOWED_LABELS only
 once you've seen them for real.
 """
 
+import json
 import os
 import sys
 import time
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -395,24 +397,30 @@ def navigate_pay_bill(
         #     CLOSED (the field is covered by a modal Scrim while
         #     "company-picker" is open, so this deliberately excludes
         #     that state - see determine_bill_screen_state's docstring).
-        if state in ("operator-dropdown-needed", "account-form-ready") and \
-                _account_number_needs_fix(elements, account_number):
-            account_number_attempts += 1
-            if account_number_attempts > MAX_ACCOUNT_NUMBER_ATTEMPTS:
-                print(f"Account number field still doesn't show {account_number!r} "
-                      f"after {account_number_attempts - 1} attempts to fix it - "
-                      f"stopping rather than repeating the same thing forever.")
-                return None
-            print(f"Account number field doesn't show {account_number!r} yet - "
-                  f"filling it in (attempt {account_number_attempts}).")
-            filled = clear_and_type_field(account_number, xml_path=xml_path)
-            if not filled:
-                print("Could not fill in the account number field - stopping.")
-                return None
-            time.sleep(1.0)
-            dismiss_keyboard()
-            time.sleep(0.5)
-            continue
+        #     Logs which branch fired every time, on purpose - this is
+        #     the one spot a silent no-op ("already correct" vs "never
+        #     even checked") is easy to mistake for the other from the
+        #     console output alone.
+        if state in ("operator-dropdown-needed", "account-form-ready"):
+            if not _account_number_needs_fix(elements, account_number):
+                print(f"Account number field already shows {account_number!r} - leaving it alone.")
+            else:
+                account_number_attempts += 1
+                if account_number_attempts > MAX_ACCOUNT_NUMBER_ATTEMPTS:
+                    print(f"Account number field still doesn't show {account_number!r} "
+                          f"after {account_number_attempts - 1} attempts to fix it - "
+                          f"stopping rather than repeating the same thing forever.")
+                    return None
+                print(f"Account number field doesn't show {account_number!r} yet - "
+                      f"filling it in (attempt {account_number_attempts}).")
+                filled = clear_and_type_field(account_number, xml_path=xml_path)
+                if not filled:
+                    print("Could not fill in the account number field - stopping.")
+                    return None
+                time.sleep(1.0)
+                dismiss_keyboard()
+                time.sleep(0.5)
+                continue
 
         # 2. "Select service type" screen - choose Pay Bill (the one
         #    hand-verified exception to the deny pattern), then Proceed
@@ -660,6 +668,34 @@ def collect_bill_fee_tiers(tiers=DEFAULT_TIERS):
     return results
 
 
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+
+
+def save_results(results, service_tile_label: str, operator: str, account_number: str) -> str:
+    """Writes one run's results to results/sahl_fees_<timestamp>.json -
+    same directory and "collected_at" + "results" shape as the old
+    (deleted) run_all_operators.py's save_results(), so a GitHub
+    Actions workflow uploading results/*.json as an artifact actually
+    has something to find. Unlike that old multi-operator sweep script,
+    `results` here is just whatever this one call to
+    navigate_pay_bill()/navigate() returned - not nested per operator.
+    Returns the path written."""
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    now = datetime.now()
+    path = os.path.join(RESULTS_DIR, f"sahl_fees_{now.strftime('%Y-%m-%d_%H-%M-%S')}.json")
+    payload = {
+        "collected_at": now.isoformat(),
+        "service_tile_label": service_tile_label,
+        "operator": operator,
+        "account_number": account_number,
+        "results": results,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
 if __name__ == "__main__":
     # AdbConnectionError propagates up through collect_bill_fee_tiers()
     # (called from inside navigate_pay_bill's own call stack) as well as
@@ -685,8 +721,12 @@ if __name__ == "__main__":
     if isinstance(results, list):
         for row in results:
             print(row)
+        saved_path = save_results(results, SERVICE_TILE_LABEL, OPERATOR, TEST_ACCOUNT_NUMBER)
+        print(f"Saved to {saved_path}")
     elif isinstance(results, dict):
         print(results)
+        saved_path = save_results(results, SERVICE_TILE_LABEL, OPERATOR, TEST_ACCOUNT_NUMBER)
+        print(f"Saved to {saved_path}")
     else:
         print("No results - navigation did not complete successfully.")
         sys.exit(1)

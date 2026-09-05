@@ -1,0 +1,74 @@
+{
+  "collected_at": "2026-09-05T22:04:50.154765",
+  "service_tile_label": "Internet",
+  "operator": "WE",
+  "account_number": "0225305397",
+  "results": [
+    {
+      "Amount Requested": "50 EGP",
+      "Service Value": "50 EGP",
+      "Service Fees": "8 EGP",
+      "Total Amount": "58 EGP"
+    },
+    {
+      "Amount Requested": "100 EGP",
+      "Service Value": "100 EGP",
+      "Service Fees": "8 EGP",
+      "Total Amount": "108 EGP"
+    },
+    {
+      "Amount Requested": "200 EGP",
+      "Service Value": "200 EGP",
+      "Service Fees": "11 EGP",
+      "Total Amount": "211 EGP"
+    },
+    {
+      "Amount Requested": "300 EGP",
+      "Service Value": "300 EGP",
+      "Service Fees": "11 EGP",
+      "Total Amount": "311 EGP"
+    },
+    {
+      "Amount Requested": "400 EGP",
+      "Service Value": "400 EGP",
+      "Service Fees": "13.50 EGP",
+      "Total Amount": "413.50 EGP"
+    },
+    {
+      "Amount Requested": "500 EGP",
+      "Service Value": "500 EGP",
+      "Service Fees": "21.25 EGP",
+      "Total Amount": "521.25 EGP"
+    },
+    {
+      "Amount Requested": "750 EGP",
+      "Service Value": "750 EGP",
+      "Service Fees": "22.88 EGP",
+      "Total Amount": "772.88 EGP"
+    },
+    {
+      "Amount Requested": "1000 EGP",
+      "Service Value": "1000 EGP",
+      "Service Fees": "24.50 EGP",
+      "Total Amount": "1024.50 EGP"
+    },
+    {
+      "Amount Requested": "1500 EGP",
+      "Service Value": "1500 EGP",
+      "Service Fees": "27.75 EGP",
+      "Total Amount": "1527.75 EGP"
+    },
+    {
+      "Amount Requested": "2000 EGP",
+      "Service Value": "2000 EGP",
+      "Service Fees": "31 EGP",
+      "Total Amount": "2031 EGP"
+    },
+    {
+      "Amount Requested": "3000 EGP",
+      "Service Value": "3000 EGP",
+      "Service Fees": "37.50 EGP",
+      "Total Amount": "3037.50 EGP"
+    }
+  ]
+}
