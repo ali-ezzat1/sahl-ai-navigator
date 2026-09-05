@@ -42,6 +42,30 @@ def bounds_to_center(bounds: str) -> tuple[int, int]:
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def _clear_field(existing_text: str, redact: bool = False) -> None:
+    """Clears whatever's already in the field that was JUST tapped to
+    focus it, before any new text gets typed - `input text` only
+    appends, it never replaces, so skipping this on a pre-filled field
+    silently produces a corrupted value (a real phone number typed on
+    top of a stale pre-filled one, observed live on Sahl's sign-in
+    screen - this is why every "type" function in this file goes
+    through here now, not just the two that used to).
+
+    `redact` swaps the printed value for asterisks of the same length
+    (still using the real length for the backspace count) - use this
+    for password fields, same discipline as fill_sign_in_form already
+    applied to its own "value not printed" logging."""
+
+    if not existing_text:
+        return
+    shown = "*" * len(existing_text) if redact else existing_text
+    print(f"Clearing existing value: {shown!r}")
+    run_adb("shell", "input", "keyevent", "123")  # KEYCODE_MOVE_END
+    for _ in range(len(existing_text) + 2):  # a couple extra backspaces for safety
+        run_adb("shell", "input", "keyevent", "67")  # KEYCODE_DEL
+    time.sleep(0.3)
+
+
 def safe_tap(label: str, xml_path: str | None = None) -> None:
     """Find `label` on the CURRENT screen and tap it - but only if
     guardrail.py says it's allowed. Refuses loudly otherwise.
@@ -358,7 +382,8 @@ def ai_free_choice_type(
     - no allowlist or deny-pattern check, same as ai_free_choice_tap.
     Re-verifies exactly one matching field exists on a fresh dump
     before acting - refuses to guess between multiple matches, same
-    discipline as fill_sign_in_form/type_into_field elsewhere.
+    discipline as fill_sign_in_form/clear_and_type_field elsewhere.
+    Clears the field first too (see _clear_field) - same reasoning.
 
     `value_key` is logged, never the raw `value` itself - callers must
     NEVER pass SAHL_PASSWORD's value through here (ai_pick.py's
@@ -384,6 +409,7 @@ def ai_free_choice_type(
           f"(value_key={value_key!r}) - reasoning: {reasoning}")
     run_adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.3)
+    _clear_field(field["label"] or "")
     run_adb("shell", "input", "text", value)
     _log_free_choice_action(goal, all_labels or [], "type", nearby_label, value_key, reasoning, taken=True)
     return True
@@ -415,14 +441,7 @@ def clear_and_type_field_at_position(text: str, position: str) -> bool:
     print(f"Tapping the {position} field at ({x}, {y}) to focus it...")
     run_adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.3)
-
-    existing_text = field["label"] or ""
-    if existing_text:
-        print(f"Clearing existing value: {existing_text!r}")
-        run_adb("shell", "input", "keyevent", "123")  # KEYCODE_MOVE_END
-        for _ in range(len(existing_text) + 2):  # a couple extra backspaces for safety
-            run_adb("shell", "input", "keyevent", "67")  # KEYCODE_DEL
-        time.sleep(0.3)
+    _clear_field(field["label"] or "")
 
     print(f"Typing: {text!r}")
     run_adb("shell", "input", "text", text)
@@ -434,9 +453,16 @@ def fill_sign_in_form(phone_number: str, password: str) -> bool:
     that ISN'T flagged password="true" in the accessibility tree, and
     password into the one that IS. Confirmed by hand from a real XML
     dump that these two fields have no other distinguishing feature -
-    both show an empty label and the SAME nearby_label (the "+20"
-    country-code icon) - so is_password is the only reliable signal.
-    Refuses to guess if the screen doesn't have exactly one of each.
+    both show the SAME nearby_label (the "+20" country-code icon) - so
+    is_password is the only reliable signal. Refuses to guess if the
+    screen doesn't have exactly one of each.
+
+    Clears each field before typing (see _clear_field) - the phone field
+    is not reliably empty: observed live with a stale pre-filled number
+    already in it, which `input text`'s append-only behavior would
+    otherwise have typed the real number on top of, producing an
+    invalid concatenated value.
+
     Does not tap Sign in itself - the caller does that separately
     through safe_tap_recovery, same as every other recovery action."""
 
@@ -459,6 +485,7 @@ def fill_sign_in_form(phone_number: str, password: str) -> bool:
     print(f"Tapping the phone number field at ({x}, {y})...")
     run_adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.3)
+    _clear_field(phone_field["label"] or "")
     print(f"Typing phone number: {phone_number!r}")
     run_adb("shell", "input", "text", phone_number)
     time.sleep(0.3)
@@ -467,6 +494,7 @@ def fill_sign_in_form(phone_number: str, password: str) -> bool:
     print(f"Tapping the password field at ({x}, {y})...")
     run_adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.3)
+    _clear_field(password_field["label"] or "", redact=True)
     print("Typing password (value not printed).")
     run_adb("shell", "input", "text", password)
     time.sleep(0.3)
@@ -505,8 +533,13 @@ def swipe_up() -> None:
     run_adb("shell", "input", "swipe", "540", "2100", "540", "500", "300")
 
 
-def type_into_field(text: str, expected_nearby_label: str | None = None) -> bool:
-    """Finds the EditText field to type into and fills it in.
+def clear_and_type_field(
+    text: str, expected_nearby_label: str | None = None, xml_path: str | None = None,
+) -> bool:
+    """Finds the EditText field to type into and fills it in, clearing
+    out whatever's already there first - `input text` only appends, so
+    a pre-filled field like Sahl's Internet due-amount box would
+    otherwise end up "450.3300" instead of "300".
 
     - If there's exactly one EditText on screen, that's an easy, safe
       choice - use it.
@@ -515,51 +548,6 @@ def type_into_field(text: str, expected_nearby_label: str | None = None) -> bool
       against the field's nearby_label context, e.g. "Amount").
     - If we can't confidently identify a field, we print what we saw
       and stop rather than typing into the wrong box.
-    """
-
-    xml_path = dump_current_screen()
-    fields = find_editable_fields(xml_path)
-
-    if not fields:
-        print("No input field (EditText) found on this screen.")
-        return False
-
-    if len(fields) == 1:
-        field = fields[0]
-    else:
-        print(f"Found {len(fields)} input fields on this screen - context near each:")
-        for f in fields:
-            print(f"  - nearby_label={f['nearby_label']!r} bounds={f['bounds']}")
-
-        if expected_nearby_label is None:
-            print("Multiple fields and no hint about which one to use - refusing to guess.")
-            return False
-
-        matches = [f for f in fields if f["nearby_label"] == expected_nearby_label]
-        if len(matches) != 1:
-            print(f"Could not uniquely match nearby_label={expected_nearby_label!r} - refusing to guess.")
-            return False
-        field = matches[0]
-
-    x, y = bounds_to_center(field["bounds"])
-    print(f"Tapping input field (nearby_label={field['nearby_label']!r}) at ({x}, {y}) to focus it...")
-    run_adb("shell", "input", "tap", str(x), str(y))
-    time.sleep(0.5)
-
-    print(f"Typing: {text!r}")
-    run_adb("shell", "input", "text", text)
-    return True
-
-
-def clear_and_type_field(
-    text: str, expected_nearby_label: str | None = None, xml_path: str | None = None,
-) -> bool:
-    """Same field-selection rules as type_into_field (single field is
-    an easy choice; multiple fields need expected_nearby_label to
-    disambiguate), but clears out whatever's already there first -
-    `input text` only appends, so a pre-filled field like Sahl's
-    Internet due-amount box would otherwise end up "450.3300" instead
-    of "300".
 
     See safe_tap's `xml_path` docstring for when it's safe to pass a
     pre-fetched dump instead of taking a fresh one here."""
@@ -593,14 +581,7 @@ def clear_and_type_field(
     print(f"Tapping input field (nearby_label={field['nearby_label']!r}) at ({x}, {y}) to focus it...")
     run_adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.3)
-
-    existing_text = field["label"] or ""
-    if existing_text:
-        print(f"Clearing existing value: {existing_text!r}")
-        run_adb("shell", "input", "keyevent", "123")  # KEYCODE_MOVE_END
-        for _ in range(len(existing_text) + 2):  # a couple extra backspaces for safety
-            run_adb("shell", "input", "keyevent", "67")  # KEYCODE_DEL
-        time.sleep(0.3)
+    _clear_field(field["label"] or "")
 
     print(f"Typing: {text!r}")
     run_adb("shell", "input", "text", text)

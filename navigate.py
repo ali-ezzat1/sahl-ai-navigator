@@ -30,7 +30,7 @@ from dump_screen import dump_current_screen, list_interesting_elements, AdbConne
 from guardrail import ALLOWED_LABELS
 from launch_sahl import ensure_sahl_open
 from ai_pick import ask_ai_which_label, classify_screen_and_pick_action
-from tap import safe_tap, safe_tap_recovery, type_into_field, dismiss_keyboard
+from tap import safe_tap, safe_tap_recovery, clear_and_type_field, dismiss_keyboard
 
 SESSION_EXPIRED_MARKER = "Session Expired"  # the app logged us out mid-flow
 SIGN_IN_SCREEN_MARKER = "Forgot password?"  # distinctive - only appears on the sign-in screen
@@ -144,7 +144,7 @@ def navigate(goal: str, phone_number: str, max_steps: int = 12, tiers=None):
             if not phone_already_filled:
                 print(f"Phone number not filled in yet - filling it in now "
                       f"(attempt {form_attempt_count}).")
-                filled = type_into_field(phone_number)
+                filled = clear_and_type_field(phone_number)
                 if not filled:
                     print("Could not fill in the phone number field - stopping.")
                     return None

@@ -11,7 +11,7 @@ import time
 
 from dump_screen import dump_screen_until_labeled, get_foreground_package
 from guardrail import ALLOWED_LABELS
-from tap import safe_tap, swipe_up
+from tap import safe_tap_by_prefix, swipe_up
 
 LAUNCHER_PACKAGE = "com.google.android.apps.nexuslauncher"
 SAHL_APP_LABEL = "Sahl"
@@ -45,9 +45,13 @@ def ensure_sahl_open(max_attempts: int = MAX_LAUNCH_ATTEMPTS) -> bool:
 
         labels = {e["label"] for e in elements if e["label"]}
 
-        if SAHL_APP_LABEL in labels:
-            print(f"App drawer is open - tapping {SAHL_APP_LABEL!r}.")
-            safe_tap(SAHL_APP_LABEL, xml_path)
+        # Prefix match, not exact - a pending notification changes Sahl's
+        # own content-desc to "Sahl has N notification(s)", which an
+        # exact "Sahl" in labels would never match. See guardrail.py's
+        # ALLOWED_LABEL_PREFIXES comment for how this was found.
+        if any(label.startswith(SAHL_APP_LABEL) for label in labels):
+            print(f"App drawer is open - tapping the {SAHL_APP_LABEL!r} icon.")
+            safe_tap_by_prefix(SAHL_APP_LABEL, xml_path)
             time.sleep(1.5)
             continue
 

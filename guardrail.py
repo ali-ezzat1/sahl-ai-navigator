@@ -63,6 +63,14 @@ ALLOWED_LABELS = {
 # which known, non-payment field can be matched by name.
 ALLOWED_LABEL_PREFIXES = {
     "Network Operator",
+    # Sahl's app-drawer icon reads exactly "Sahl" with content-desc="Sahl"
+    # normally, but Android appends to it whenever the app has a pending
+    # notification - confirmed by hand from a real dump reading
+    # content-desc="Sahl has 1 notification" instead. Exact-matching
+    # "Sahl" alone breaks the moment a notification badge appears; this
+    # prefix still goes through DENY_PATTERN like everything else, it
+    # only widens which exact string of the same known icon counts.
+    "Sahl",
 }
 
 # Groups of labels that are each INDIVIDUALLY already on ALLOWED_LABELS
