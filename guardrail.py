@@ -52,6 +52,12 @@ ALLOWED_LABELS = {
     # confirmed by hand: tapping this in the app drawer just opens
     # Sahl, nothing else.
     "Sahl",
+    # added for the mobile-verification (OTP) screen - confirmed from a
+    # real user-supplied XML dump: a distinct clickable node,
+    # content-desc="Verify", cleanly separate from the title/message
+    # text (unlike the merged Session Expired dialog above) - tapping
+    # it only ever submits the entered code, never moves money.
+    "Verify",
 }
 
 # Some elements' labels change with app state - e.g. the network
@@ -147,6 +153,15 @@ RECOVERY_ALLOWED_LABELS = {
 # never exposed to the AI's free choice, same as every other recovery
 # check in this file.
 SESSION_EXPIRED_MARKER_TEXT = "Session Expired"
+
+# Marks Sahl's mobile-verification (OTP) screen - a real user-supplied
+# XML dump shows a stable title node, content-desc="Mobile Verification",
+# unrelated to and unlike SESSION_EXPIRED_MARKER_TEXT's merged-node
+# situation: the EditText and the "Verify" button are each their own
+# separate, cleanly clickable nodes here, so no special-cased tap logic
+# is needed for this screen the way it is for Session Expired - only
+# detecting when it's showing at all.
+OTP_SCREEN_MARKER = "Mobile Verification"
 
 
 def check_session_expired_tap_allowed(label: str) -> tuple[bool, str]:

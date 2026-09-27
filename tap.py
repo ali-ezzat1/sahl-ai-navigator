@@ -32,6 +32,7 @@ from guardrail import (
 BOUNDS_PATTERN = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 
 FREE_CHOICE_LOG_PATH = os.path.join(os.path.dirname(__file__), "logs", "ai_free_choice.log")
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
 
 
 def bounds_to_center(bounds: str) -> tuple[int, int]:
@@ -40,6 +41,23 @@ def bounds_to_center(bounds: str) -> tuple[int, int]:
 
     x1, y1, x2, y2 = map(int, BOUNDS_PATTERN.match(bounds).groups())
     return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def bounds_to_lower_point(bounds: str, fraction: float = 0.85) -> tuple[int, int]:
+    """Like bounds_to_center, but returns a point biased toward the
+    BOTTOM of the box instead of its exact center - `fraction` is how
+    far down the box's height to land (0.0 = top edge, 1.0 = bottom
+    edge). Modal dialogs conventionally stack a title, then a message,
+    then a button along the bottom, so for a box whose bounds cover an
+    entire merged dialog (title + message + button all one node - see
+    safe_tap_session_expired_dialog), a point near the bottom is more
+    likely to land on the real button than the box's geometric center
+    is, which lands squarely in the message text instead."""
+
+    x1, y1, x2, y2 = map(int, BOUNDS_PATTERN.match(bounds).groups())
+    x = (x1 + x2) // 2
+    y = int(y1 + fraction * (y2 - y1))
+    return x, y
 
 
 def _clear_field(existing_text: str, redact: bool = False) -> None:
@@ -103,6 +121,37 @@ def safe_tap(label: str, xml_path: str | None = None) -> None:
     run_adb("shell", "input", "tap", str(x), str(y))
 
 
+# Bottom-biased fractions to try in order when tapping the bill flow's
+# merged Session Expired/Ok dialog - see bounds_to_lower_point's
+# docstring for why bottom-biased beats the geometric center. We don't
+# have a real captured XML for this specific dialog yet (see
+# _save_session_expired_debug_dump below, which fixes that for next
+# time), so this ordering is a best-effort guess, not a confirmed-by-
+# hand button position like everything else in guardrail.py's
+# allowlists: start closest to where an "Ok" button conventionally
+# sits (near the bottom), then try progressively higher in case the
+# real layout differs from that assumption.
+SESSION_EXPIRED_TAP_FRACTIONS = (0.85, 0.95, 0.75)
+
+
+def _save_session_expired_debug_dump(xml_path: str) -> None:
+    """Copies the raw dump that caught the Session Expired dialog to
+    debug/session_expired_<timestamp>.xml, every time this dialog is
+    seen. We don't have a real captured XML for it yet - the tap logic
+    below is a bottom-biased HEURISTIC guess, not a hand-verified
+    position - so the next time this fires for real (locally, or in
+    CI where debug/*.xml gets uploaded alongside results/*.json) this
+    gives us the exact bounds needed to replace the heuristic with a
+    precise fix instead of guessing again."""
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dest = os.path.join(DEBUG_DIR, f"session_expired_{timestamp}.xml")
+    with open(xml_path, "rb") as src, open(dest, "wb") as out:
+        out.write(src.read())
+    print(f"Saved a debug copy of this dialog's XML to {dest}")
+
+
 def safe_tap_session_expired_dialog() -> bool:
     """Taps the bill flow's merged "Session Expired ... Ok" dialog -
     see guardrail.check_session_expired_tap_allowed for why this needs
@@ -110,31 +159,65 @@ def safe_tap_session_expired_dialog() -> bool:
     exact-match RECOVERY_ALLOWED_LABELS. Finds the element by SUBSTRING
     (the label contains "Session Expired" somewhere in a longer merged
     string) rather than exact match, since there's no element whose
-    label is exactly "Ok" to look for here."""
+    label is exactly "Ok" to look for here.
+
+    Because the WHOLE dialog (title + message + "Ok") is one merged
+    clickable node, tapping its geometric center - what every other tap
+    helper in this file does - tends to land on the message text
+    instead of the actual "Ok" hit-target, since the message text
+    visually dominates the box. We don't have a real captured XML for
+    this specific dialog to know its exact layout, so instead of one
+    centered tap this tries a small, ordered set of bottom-biased
+    points (see SESSION_EXPIRED_TAP_FRACTIONS), re-dumping after each
+    one to check whether the dialog is gone, and only gives up once
+    every fraction has been tried. Every attempt also saves a debug
+    copy of the dump - see _save_session_expired_debug_dump."""
 
     xml_path = dump_current_screen()
 
-    matching_element = None
-    for element in list_interesting_elements(xml_path):
-        if element["clickable"] and element["label"] and SESSION_EXPIRED_MARKER_TEXT in element["label"]:
-            matching_element = element
-            break
+    for attempt, fraction in enumerate(SESSION_EXPIRED_TAP_FRACTIONS, start=1):
+        matching_element = None
+        for element in list_interesting_elements(xml_path):
+            if element["clickable"] and element["label"] and SESSION_EXPIRED_MARKER_TEXT in element["label"]:
+                matching_element = element
+                break
 
-    if matching_element is None:
-        print("Did not find a tappable Session Expired dialog on the current screen.")
+        if matching_element is None:
+            if attempt == 1:
+                print("Did not find a tappable Session Expired dialog on the current screen.")
+                return False
+            print("Session Expired dialog is gone - dismissed successfully.")
+            return True
+
+        label = matching_element["label"]
+        allowed, reason = check_session_expired_tap_allowed(label)
+        print(reason)
+
+        if not allowed:
+            print("-> NOT tapping.")
+            return False
+
+        if attempt == 1:
+            _save_session_expired_debug_dump(xml_path)
+
+        x, y = bounds_to_lower_point(matching_element["bounds"], fraction)
+        print(f"-> Tapping session-expired dialog at ({x}, {y}) "
+              f"(attempt {attempt}/{len(SESSION_EXPIRED_TAP_FRACTIONS)}, fraction={fraction})")
+        run_adb("shell", "input", "tap", str(x), str(y))
+        time.sleep(1.0)
+
+        xml_path = dump_current_screen()
+
+    still_present = any(
+        element["clickable"] and element["label"] and SESSION_EXPIRED_MARKER_TEXT in element["label"]
+        for element in list_interesting_elements(xml_path)
+    )
+    if still_present:
+        print(f"Still seeing the Session Expired dialog after "
+              f"{len(SESSION_EXPIRED_TAP_FRACTIONS)} tap attempts - giving up.")
         return False
 
-    label = matching_element["label"]
-    allowed, reason = check_session_expired_tap_allowed(label)
-    print(reason)
-
-    if not allowed:
-        print("-> NOT tapping.")
-        return False
-
-    x, y = bounds_to_center(matching_element["bounds"])
-    print(f"-> Tapping session-expired dialog at ({x}, {y})")
-    run_adb("shell", "input", "tap", str(x), str(y))
+    print("Session Expired dialog is gone - dismissed successfully.")
     return True
 
 

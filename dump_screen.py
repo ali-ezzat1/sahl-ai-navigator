@@ -17,37 +17,59 @@ import xml.etree.ElementTree as ET
 DUMP_PATH_ON_PHONE = "/sdcard/window_dump.xml"
 DUMP_PATH_LOCAL = "window_dump.xml"
 
+# Confirmed live: adb can die mid-command with exit code 137 (SIGKILL)
+# while the emulator itself is still open and responsive - not a real
+# device/emulator problem, most likely something else on the machine
+# (Android Studio's device panel, scrcpy, etc.) momentarily restarting
+# the adb server out from under the in-flight command. Retrying a
+# couple of times before giving up recovers from exactly this, without
+# masking a genuinely dead adb/emulator (FileNotFoundError - adb not on
+# PATH at all - is NOT retried below, since retrying can't fix that).
+ADB_RETRY_ATTEMPTS = 3
+ADB_RETRY_DELAY_SECONDS = 1.5
+
 
 class AdbConnectionError(Exception):
-    """Raised when an adb command fails - non-zero exit, adb itself not
-    found on PATH, or a timeout. Every adb call in this project goes
-    through run_adb() below, so this is the ONE exception type callers
-    ever need to catch, and the ONE place a future automatic-recovery
-    step (planned: reboot the emulator and retry) needs to be added -
-    no call site elsewhere needs to change when that gets built."""
+    """Raised when an adb command still fails after ADB_RETRY_ATTEMPTS -
+    non-zero exit, a timeout, or adb itself not found on PATH (that one
+    is never retried - see run_adb). Every adb call in this project
+    goes through run_adb() below, so this is the ONE exception type
+    callers ever need to catch."""
 
 
 def run_adb(*args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
     """Runs `adb <args>`, raising AdbConnectionError with a clear
-    message on any failure instead of letting a raw
-    CalledProcessError/TimeoutExpired/FileNotFoundError propagate as an
+    message if it still fails after ADB_RETRY_ATTEMPTS attempts, instead
+    of letting a raw CalledProcessError/TimeoutExpired propagate as an
     unhandled traceback. Every adb-shelling function in this project
-    (here and in tap.py) calls this instead of subprocess.run directly."""
+    (here and in tap.py) calls this instead of subprocess.run directly.
 
-    try:
-        return subprocess.run(["adb", *args], check=True, timeout=timeout)
-    except subprocess.CalledProcessError as e:
-        raise AdbConnectionError(
-            f"adb command failed (exit code {e.returncode}): adb {' '.join(args)}"
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise AdbConnectionError(
-            f"adb command timed out after {timeout}s: adb {' '.join(args)}"
-        ) from e
-    except FileNotFoundError as e:
-        raise AdbConnectionError(
-            "adb was not found - is it installed and on PATH?"
-        ) from e
+    Retries CalledProcessError and TimeoutExpired - both can be
+    transient (a momentary adb server restart, a slow device) - but
+    NOT FileNotFoundError, which means adb itself isn't on PATH at all;
+    that's a permanent environment problem no amount of retrying fixes."""
+
+    for attempt in range(1, ADB_RETRY_ATTEMPTS + 1):
+        try:
+            return subprocess.run(["adb", *args], check=True, timeout=timeout)
+        except FileNotFoundError as e:
+            raise AdbConnectionError(
+                "adb was not found - is it installed and on PATH?"
+            ) from e
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if attempt == ADB_RETRY_ATTEMPTS:
+                if isinstance(e, subprocess.CalledProcessError):
+                    raise AdbConnectionError(
+                        f"adb command failed (exit code {e.returncode}): adb {' '.join(args)}"
+                    ) from e
+                raise AdbConnectionError(
+                    f"adb command timed out after {timeout}s: adb {' '.join(args)}"
+                ) from e
+            print(f"adb command failed on attempt {attempt}/{ADB_RETRY_ATTEMPTS} "
+                  f"(adb {' '.join(args)}) - retrying in {ADB_RETRY_DELAY_SECONDS}s. "
+                  f"Often just a momentary adb server restart, not a real "
+                  f"device/emulator problem.")
+            time.sleep(ADB_RETRY_DELAY_SECONDS)
 
 
 def dump_current_screen() -> str:
@@ -113,6 +135,39 @@ def list_interesting_elements(xml_path: str):
             last_label_seen = label
 
 
+# Labels that change on their own between reads with no user action -
+# a live countdown, for instance. dump_screen_until_labeled() below
+# decides a screen has finished loading by comparing two consecutive
+# reads, and a self-updating label makes that comparison NEVER match,
+# so it burns its entire max_wait_seconds on a screen that was ready
+# immediately. Confirmed live on Sahl's OTP screen, whose "Resend OTP
+# in 35s" ticks down once a second: every visit to that screen cost a
+# full 10s timeout and ~19 wasted dumps, which is also what let the
+# phone's OTP relay beat the script's own Slack alert (see
+# slack_otp.OTP_LOOKBACK_SECONDS).
+#
+# Matched by PREFIX deliberately - same idiom as guardrail.py's
+# ALLOWED_LABEL_PREFIXES, and far safer than a generic "ignore any
+# label containing digits" rule, which would also mask a fee screen
+# whose amounts are still recalculating - exactly the case this
+# stability check exists to catch.
+VOLATILE_LABEL_PREFIXES = (
+    "Resend OTP in",
+)
+
+
+def _stability_signature(elements) -> frozenset:
+    """The labels used to decide whether two consecutive reads show the
+    same screen: everything with a label, minus the self-updating ones
+    (see VOLATILE_LABEL_PREFIXES). Only the COMPARISON ignores these -
+    callers still receive every element, countdown included."""
+
+    return frozenset(
+        e["label"] for e in elements
+        if e["label"] and not e["label"].startswith(VOLATILE_LABEL_PREFIXES)
+    )
+
+
 def dump_screen_until_labeled(
     max_wait_seconds: float = 10.0,
     poll_interval: float = 1.0,
@@ -137,6 +192,12 @@ def dump_screen_until_labeled(
     Two consecutive reads catches that: the transient label set won't
     match the one that replaces it.
 
+    Labels that update on their own every second (a countdown) are
+    excluded from that comparison - see VOLATILE_LABEL_PREFIXES - since
+    they'd otherwise guarantee the two reads never match and force a
+    full max_wait_seconds timeout on a screen that was ready the whole
+    time. They're still returned to the caller in `elements`.
+
     While a dump has no labels at all, polls at the full poll_interval
     cadence (same as before). Once a dump DOES have labels, the
     confirmation re-check uses the shorter stability_check_seconds gap
@@ -156,7 +217,7 @@ def dump_screen_until_labeled(
     elements = list(list_interesting_elements(xml_path))
 
     while True:
-        labels_now = frozenset(e["label"] for e in elements if e["label"])
+        labels_now = _stability_signature(elements)
 
         if labels_now and labels_now == previous_labels:
             return xml_path, elements

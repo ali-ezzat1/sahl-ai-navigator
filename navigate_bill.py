@@ -65,7 +65,8 @@ from tap import (
 )
 from navigate import extract_fee_summary, SIGN_IN_SCREEN_MARKER
 from ai_pick import suggest_relabel, classify_screen_and_pick_action, ask_ai_free_choice
-from guardrail import ALLOWED_LABELS, ACTION_SYNONYMS, SESSION_EXPIRED_MARKER_TEXT
+from guardrail import ALLOWED_LABELS, ACTION_SYNONYMS, SESSION_EXPIRED_MARKER_TEXT, OTP_SCREEN_MARKER
+from slack_otp import post_slack_alert, poll_for_otp_code, SlackNotConfigured
 
 load_dotenv()
 
@@ -96,7 +97,7 @@ BILL_SCREEN_STATES = [
     "fee-confirmation",
 ]
 
-DEFAULT_TIERS = [50, 100, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000]
+DEFAULT_TIERS = [100,300,500]
 WAIT_FOR_LIVE_CALC_SECONDS = 0.5
 # Bumped from 12: session recovery (dismiss dialog + fill sign-in form
 # + up to MAX_SIGN_IN_RETRIES wait-retries) can now eat 5+ steps on its
@@ -288,6 +289,73 @@ def attempt_session_recovery(all_labels: list[str], sign_in_state: dict) -> bool
     return True
 
 
+class OtpRecoveryFailed(Exception):
+    """Raised by attempt_otp_recovery when the OTP screen could not be
+    cleared - Slack isn't configured (see slack_otp.SlackNotConfigured),
+    no code arrived from Slack within the poll timeout, or the code
+    field couldn't be uniquely identified. Same contract as
+    SessionRecoveryFailed: callers decide what "give up" means in their
+    own context."""
+
+
+def attempt_otp_recovery(all_labels: list[str]) -> bool:
+    """Checks for Sahl's mobile-verification (OTP) screen - see
+    guardrail.OTP_SCREEN_MARKER. If present: posts a Slack alert,
+    polls the same channel for a reply containing a 6-digit code (see
+    slack_otp.py - the code itself comes from a human relaying an
+    incoming SMS via an iPhone Shortcuts automation, not anything Sahl
+    sends to Slack directly), types it into the code field, and taps
+    Verify. Returns True if handled - the caller should treat the
+    screen as having just changed and re-dump/re-check from the top,
+    same as attempt_session_recovery. Returns False if the OTP screen
+    isn't present at all - nothing to recover from, proceed normally.
+
+    Raises OtpRecoveryFailed if the screen couldn't be cleared - see
+    that exception's docstring for what each caller does with it."""
+
+    if OTP_SCREEN_MARKER not in all_labels:
+        return False
+
+    print("Mobile verification (OTP) screen detected - alerting Slack and waiting for a code.")
+    try:
+        # timespec="seconds" is load-bearing, not cosmetic: a full
+        # isoformat() renders microseconds as exactly six digits, which
+        # slack_otp.OTP_CODE_PATTERN matches - so the alert would
+        # contain a "code" of its own. poll_for_otp_code already skips
+        # this message by ts; keeping a matchable number out of the
+        # text is the second, independent check (same discipline
+        # guardrail.py applies to taps).
+        alert_ts = post_slack_alert(
+            f"Sahl bill-pay run needs an OTP code to continue "
+            f"(detected at {datetime.now().isoformat(timespec='seconds')})."
+        )
+    except SlackNotConfigured as e:
+        raise OtpRecoveryFailed(f"can't alert Slack: {e}") from e
+
+    code = poll_for_otp_code(alert_ts)
+    if code is None:
+        raise OtpRecoveryFailed("no OTP code arrived from Slack within the poll timeout")
+
+    xml_path, elements = dump_screen_until_labeled()
+    fields = [e for e in elements if e["class"] == "android.widget.EditText"]
+    if len(fields) != 1:
+        raise OtpRecoveryFailed(
+            f"expected exactly one OTP EditText field, found {len(fields)} - refusing to guess"
+        )
+
+    filled = clear_and_type_field(code, xml_path=xml_path)
+    if not filled:
+        raise OtpRecoveryFailed("could not type the OTP code into the field")
+
+    time.sleep(0.5)
+    dismiss_keyboard()
+    time.sleep(0.5)
+    print("Tapping Verify.")
+    safe_tap("Verify")
+    time.sleep(2.0)
+    return True
+
+
 def navigate_pay_bill(
     service_tile_label: str,
     operator: str,
@@ -343,6 +411,18 @@ def navigate_pay_bill(
     # closes it forever without ever reaching Enquire.
     operator_confirmed = False
 
+    # Whether the home-screen tile has been tapped yet THIS RUN - can't
+    # gate this on "step == 1" the way it used to, since
+    # attempt_session_recovery/attempt_otp_recovery are checked before
+    # this branch and each `continue` on a recovery action consumes a
+    # step of its own. A session expiry or a slow sign-in redirect can
+    # eat step 1 (or more) entirely before the home screen with the
+    # tile ever actually appears - confirmed live: a real run's sign-in
+    # recovery consumed step 1, so the tile didn't show up until step
+    # 2, and "step == 1" silently never matched, falling through to the
+    # tier-2 AI fallback for something that should've been deterministic.
+    home_tile_tapped = False
+
     # Counts how many times the account-number-fix branch below has
     # fired this run - see MAX_ACCOUNT_NUMBER_ATTEMPTS.
     account_number_attempts = 0
@@ -378,15 +458,24 @@ def navigate_pay_bill(
             print(f"Session recovery failed - stopping. ({e})")
             return None
 
-        # 1. home screen - tap the service tile (only makes sense as
-        #    the very first thing we try). If it's not there, we don't
-        #    special-case anything here - just fall through to the
-        #    catch-all at the bottom, which already checks
-        #    service_tile_label (and every other known anchor) via
-        #    suggest_relabel before giving up.
-        if step == 1 and service_tile_label in all_labels:
+        try:
+            if attempt_otp_recovery(all_labels):
+                continue
+        except OtpRecoveryFailed as e:
+            print(f"OTP recovery failed - stopping. ({e})")
+            return None
+
+        # 1. home screen - tap the service tile (only makes sense once,
+        #    before we've ever tapped it this run - see home_tile_tapped
+        #    above for why this can no longer be gated on step == 1).
+        #    If it's not there, we don't special-case anything here -
+        #    just fall through to the catch-all at the bottom, which
+        #    already checks service_tile_label (and every other known
+        #    anchor) via suggest_relabel before giving up.
+        if not home_tile_tapped and service_tile_label in all_labels:
             print(f"Tapping the {service_tile_label!r} tile on the home screen.")
             safe_tap(service_tile_label, xml_path)
+            home_tile_tapped = True
             time.sleep(1.5)
             continue
 
@@ -620,6 +709,13 @@ def _collect_one_tier(amount, sign_in_state: dict):
             print(f"Could not recover session for {amount} EGP - skipping this tier. ({e})")
             return None
 
+        try:
+            if attempt_otp_recovery(all_labels):
+                continue
+        except OtpRecoveryFailed as e:
+            print(f"Could not recover OTP for {amount} EGP - skipping this tier. ({e})")
+            return None
+
         filled = clear_and_type_field(str(amount), xml_path=xml_path)
         if not filled:
             print(f"Could not fill in {amount} EGP - skipping this tier.")
@@ -637,6 +733,16 @@ def _collect_one_tier(amount, sign_in_state: dict):
                 continue
         except SessionRecoveryFailed as e:
             print(f"Could not recover session while reading {amount} EGP - "
+                  f"skipping this tier. ({e})")
+            return None
+
+        try:
+            if attempt_otp_recovery(all_labels):
+                print(f"OTP needed while reading {amount} EGP's result - "
+                      f"retrying this tier from the top.")
+                continue
+        except OtpRecoveryFailed as e:
+            print(f"Could not recover OTP while reading {amount} EGP - "
                   f"skipping this tier. ({e})")
             return None
 

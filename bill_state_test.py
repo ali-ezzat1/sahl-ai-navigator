@@ -22,11 +22,13 @@ from navigate_bill import (
     determine_bill_screen_state,
     attempt_session_recovery,
     SessionRecoveryFailed,
+    attempt_otp_recovery,
+    OtpRecoveryFailed,
     MAX_SIGN_IN_RETRIES,
     navigate_pay_bill,
     _account_number_needs_fix,
 )
-from guardrail import check_session_expired_tap_allowed
+from guardrail import check_session_expired_tap_allowed, OTP_SCREEN_MARKER
 import dump_screen
 from dump_screen import list_interesting_elements, find_editable_fields, run_adb, AdbConnectionError
 from navigate import SIGN_IN_SCREEN_MARKER, extract_fee_summary
@@ -34,6 +36,8 @@ import ai_pick
 from ai_pick import ask_ai_free_choice
 import tap
 from tap import ai_free_choice_tap, ai_free_choice_type
+import slack_otp
+from slack_otp import SlackNotConfigured
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "test_fixtures")
 SIGN_IN_SCREEN_XML = os.path.join(FIXTURES_DIR, "sign_in_screen.xml")
@@ -230,12 +234,16 @@ def run():
             failures += 1
         print(f"{status}  sign-in screen fixture: {description}")
 
-    # run_adb: every failure mode must surface as AdbConnectionError,
-    # never a raw CalledProcessError/TimeoutExpired/FileNotFoundError -
-    # that's the whole point of centralizing every adb call through it.
-    # Monkeypatch subprocess.run temporarily rather than relying on a
-    # real adb binary being present (or absent) wherever this test runs.
+    # run_adb: every failure mode must surface as AdbConnectionError
+    # after retrying ADB_RETRY_ATTEMPTS times (never a raw
+    # CalledProcessError/TimeoutExpired), except FileNotFoundError,
+    # which must raise immediately with NO retry - that's a permanent
+    # "adb isn't on PATH" problem, not a transient one. Monkeypatch
+    # subprocess.run and time.sleep temporarily rather than relying on
+    # a real adb binary or real delays wherever this test runs.
     real_subprocess_run = dump_screen.subprocess.run
+    real_dump_screen_sleep = dump_screen.time.sleep
+    dump_screen.time.sleep = lambda seconds: None
 
     def _raise(exc):
         def _fake_run(*args, **kwargs):
@@ -244,32 +252,74 @@ def run():
 
     ADB_FAILURE_CASES = [
         (
-            "adb exits non-zero (CalledProcessError)",
+            "adb exits non-zero every attempt (CalledProcessError) - "
+            "retries, then raises AdbConnectionError",
             subprocess.CalledProcessError(1, ["adb", "shell", "true"]),
         ),
         (
-            "adb call times out (TimeoutExpired)",
+            "adb call times out every attempt (TimeoutExpired) - "
+            "retries, then raises AdbConnectionError",
             subprocess.TimeoutExpired(["adb", "shell", "true"], 5),
         ),
         (
-            "adb itself not found on PATH (FileNotFoundError)",
+            "adb itself not found on PATH (FileNotFoundError) - "
+            "raises immediately, no retry",
             FileNotFoundError("adb"),
         ),
     ]
     for description, exc in ADB_FAILURE_CASES:
-        dump_screen.subprocess.run = _raise(exc)
+        call_count = {"n": 0}
+
+        def _fake_run(*args, **kwargs):
+            call_count["n"] += 1
+            raise exc
+        dump_screen.subprocess.run = _fake_run
         try:
             run_adb("shell", "true")
             print(f"FAIL  run_adb: {description} - expected AdbConnectionError, got no exception")
             failures += 1
         except AdbConnectionError:
-            print(f"PASS  run_adb: {description} -> raised AdbConnectionError as expected")
+            expected_calls = 1 if isinstance(exc, FileNotFoundError) else dump_screen.ADB_RETRY_ATTEMPTS
+            passed = call_count["n"] == expected_calls
+            status = "PASS" if passed else "FAIL"
+            if not passed:
+                failures += 1
+            print(f"{status}  run_adb: {description} -> raised AdbConnectionError "
+                  f"after {call_count['n']} call(s) (expected {expected_calls})")
         except Exception as e:
             print(f"FAIL  run_adb: {description} - wrong exception type "
                   f"{type(e).__name__}: {e}")
             failures += 1
         finally:
             dump_screen.subprocess.run = real_subprocess_run
+
+    # transient failure - fails once, then succeeds - must recover via
+    # retry rather than raising, proving the retry loop actually helps
+    # rather than just re-labeling every failure as AdbConnectionError.
+    transient_call_count = {"n": 0}
+
+    def _fake_run_transient_recovery(*args, **kwargs):
+        transient_call_count["n"] += 1
+        if transient_call_count["n"] == 1:
+            raise subprocess.CalledProcessError(137, ["adb", "shell", "true"])
+        return subprocess.CompletedProcess(args, 0)
+
+    dump_screen.subprocess.run = _fake_run_transient_recovery
+    try:
+        result = run_adb("shell", "true")
+        passed = transient_call_count["n"] == 2 and result.returncode == 0
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            failures += 1
+        print(f"{status}  run_adb: transient failure (fails once, then succeeds) - "
+              f"retry recovers instead of raising")
+    except AdbConnectionError as e:
+        print(f"FAIL  run_adb: transient failure - retry should have recovered, "
+              f"raised AdbConnectionError instead: {e}")
+        failures += 1
+    finally:
+        dump_screen.subprocess.run = real_subprocess_run
+        dump_screen.time.sleep = real_dump_screen_sleep
 
     # dump_screen_until_labeled: verify the stability mechanism (Item D)
     # actually waits out a screen whose labels are still CHANGING across
@@ -336,6 +386,51 @@ def run():
             failures += 1
         print(f"{status}  dump_screen_until_labeled: {description}")
         print(f"      expected={expected!r} actual={actual!r}")
+
+    # A screen carrying a live countdown must NOT defeat the stability
+    # check. Sahl's OTP screen ticks "Resend OTP in 35s" down once a
+    # second, so two consecutive reads never matched and every visit
+    # burned the full max_wait_seconds (~19 wasted dumps, observed
+    # live). With VOLATILE_LABEL_PREFIXES filtered out of the
+    # comparison, the rest of the screen is stable on read 2.
+    countdown_screens = [
+        ["Mobile Verification", "Enter the 6 Digit Code", "Verify", f"Resend OTP in {n}s"]
+        for n in range(35, 15, -1)  # 20 distinct reads, countdown never repeats
+    ]
+    countdown_state = {"dumps": 0}
+
+    def _fake_countdown_dump():
+        return countdown_state["dumps"]
+
+    def _fake_countdown_list(step_index):
+        idx = min(step_index, len(countdown_screens) - 1)
+        countdown_state["dumps"] += 1
+        return [{"label": lbl, "clickable": False} for lbl in countdown_screens[idx]]
+
+    real_dump_sleep = dump_screen.time.sleep
+    dump_screen.dump_current_screen = _fake_countdown_dump
+    dump_screen.list_interesting_elements = _fake_countdown_list
+    dump_screen.time.sleep = lambda seconds: None
+    try:
+        _, countdown_elements = dump_screen.dump_screen_until_labeled(max_wait_seconds=10.0)
+        returned_labels = {e["label"] for e in countdown_elements if e["label"]}
+        # stopped on read 2 (not ~21), and the countdown is still handed
+        # to the caller - only the COMPARISON ignores it
+        passed = (
+            countdown_state["dumps"] == 2
+            and any(lbl.startswith("Resend OTP in") for lbl in returned_labels)
+        )
+    finally:
+        dump_screen.dump_current_screen = real_dump_current_screen
+        dump_screen.list_interesting_elements = real_list_interesting_elements
+        dump_screen.time.sleep = real_dump_sleep
+
+    status = "PASS" if passed else "FAIL"
+    if not passed:
+        failures += 1
+    print(f"{status}  dump_screen_until_labeled: a live countdown label doesn't "
+          f"defeat stability detection (stopped after {countdown_state['dumps']} "
+          f"dumps, expected 2)")
 
     # extract_fee_summary: value must actually look like a currency
     # amount before being trusted - real observed values from an actual
@@ -512,6 +607,306 @@ def run():
         if not passed:
             failures += 1
         print(f"{status}  attempt_session_recovery: {description}")
+
+    # attempt_otp_recovery: same mocked-call-log style as
+    # attempt_session_recovery above - never touches adb or Slack for
+    # real. Covers: marker absent (no-op), Slack not configured (raises
+    # before any dump/type/tap), no code within the poll timeout
+    # (raises), and the full happy path (types the code, taps Verify).
+    real_post_slack_alert = navigate_bill.post_slack_alert
+    real_poll_for_otp_code = navigate_bill.poll_for_otp_code
+    real_dump_screen_until_labeled = navigate_bill.dump_screen_until_labeled
+    real_clear_and_type_field = navigate_bill.clear_and_type_field
+    real_dismiss_keyboard = navigate_bill.dismiss_keyboard
+    real_safe_tap_otp = navigate_bill.safe_tap
+
+    OTP_FIELD_ELEMENTS = [
+        {"label": OTP_SCREEN_MARKER, "clickable": False, "class": "android.view.View",
+         "nearby_label": None, "bounds": "[312,208][768,274]", "is_password": False},
+        {"label": "", "clickable": True, "class": "android.widget.EditText",
+         "nearby_label": "Enter the 6 Digit Code", "bounds": "[173,722][908,827]", "is_password": False},
+    ]
+
+    def _install_otp_mocks(alert_ts="1234.5678", code="123456", fill_result=True):
+        call_log = []
+        navigate_bill.post_slack_alert = lambda text: call_log.append(f"alert:{text!r}") or alert_ts
+        navigate_bill.poll_for_otp_code = lambda ts: call_log.append(f"poll:{ts!r}") or code
+        navigate_bill.dump_screen_until_labeled = lambda: (
+            call_log.append("dump") or ("fake_xml_path", OTP_FIELD_ELEMENTS)
+        )
+        navigate_bill.clear_and_type_field = lambda text, xml_path=None: (
+            call_log.append(f"type:{text!r}") or fill_result
+        )
+        navigate_bill.dismiss_keyboard = lambda: call_log.append("dismiss_keyboard")
+        navigate_bill.safe_tap = lambda label: call_log.append(f"tap:{label}")
+        navigate_bill.time.sleep = lambda seconds: None
+        return call_log
+
+    def _restore_otp_mocks():
+        navigate_bill.post_slack_alert = real_post_slack_alert
+        navigate_bill.poll_for_otp_code = real_poll_for_otp_code
+        navigate_bill.dump_screen_until_labeled = real_dump_screen_until_labeled
+        navigate_bill.clear_and_type_field = real_clear_and_type_field
+        navigate_bill.dismiss_keyboard = real_dismiss_keyboard
+        navigate_bill.safe_tap = real_safe_tap_otp
+        navigate_bill.time.sleep = real_sleep
+
+    OTP_RECOVERY_CHECKS = []
+
+    # 1. marker not present - no-op, no side effects at all
+    call_log = _install_otp_mocks()
+    try:
+        result = attempt_otp_recovery(["Some Normal Screen"])
+        OTP_RECOVERY_CHECKS.append((
+            "OTP marker not present - returns False, no Slack/adb calls",
+            result is False and call_log == [],
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    # 2. marker present, Slack not configured - raises before any dump/type/tap
+    call_log = _install_otp_mocks()
+    navigate_bill.post_slack_alert = lambda text: (_ for _ in ()).throw(
+        SlackNotConfigured("neither SLACK_BOT_TOKEN+SLACK_CHANNEL_ID nor SLACK_WEBHOOK_URL is set in .env")
+    )
+    try:
+        raised = False
+        try:
+            attempt_otp_recovery([OTP_SCREEN_MARKER])
+        except OtpRecoveryFailed:
+            raised = True
+        OTP_RECOVERY_CHECKS.append((
+            "OTP screen, Slack not configured - raises OtpRecoveryFailed",
+            raised,
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    # 3. marker present, alert posted, but no code arrives - raises
+    call_log = _install_otp_mocks(code=None)
+    try:
+        raised = False
+        try:
+            attempt_otp_recovery([OTP_SCREEN_MARKER])
+        except OtpRecoveryFailed:
+            raised = True
+        OTP_RECOVERY_CHECKS.append((
+            "OTP screen, no code from Slack within timeout - raises OtpRecoveryFailed, "
+            "still posts the alert first",
+            raised and call_log[0].startswith("alert:"),
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    # 4. full happy path - alert, poll, type the code, dismiss keyboard, tap Verify
+    call_log = _install_otp_mocks(alert_ts="1234.5678", code="123456")
+    try:
+        result = attempt_otp_recovery([OTP_SCREEN_MARKER])
+        OTP_RECOVERY_CHECKS.append((
+            "OTP screen, code arrives from Slack - types it and taps Verify",
+            result is True and call_log[0].startswith("alert:") and call_log[1:] == [
+                "poll:'1234.5678'", "dump", "type:'123456'", "dismiss_keyboard", "tap:Verify",
+            ],
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    for description, passed in OTP_RECOVERY_CHECKS:
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            failures += 1
+        print(f"{status}  attempt_otp_recovery: {description}")
+
+    # slack_otp.post_slack_alert / poll_for_otp_code: mocked HTTP calls,
+    # zero real network access. Covers both credential shapes documented
+    # in slack_otp.py's module docstring.
+    class _FakeResponse:
+        def __init__(self, json_payload):
+            self._json_payload = json_payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._json_payload
+
+    real_requests_post = slack_otp.requests.post
+    real_requests_get = slack_otp.requests.get
+    real_bot_token = slack_otp.SLACK_BOT_TOKEN
+    real_channel_id = slack_otp.SLACK_CHANNEL_ID
+    real_webhook_url = slack_otp.SLACK_WEBHOOK_URL
+    real_slack_sleep = slack_otp.time.sleep
+
+    SLACK_OTP_CHECKS = []
+
+    # bot token configured - post_slack_alert uses chat.postMessage and
+    # returns the message's ts
+    slack_otp.SLACK_BOT_TOKEN = "xoxb-fake"
+    slack_otp.SLACK_CHANNEL_ID = "C123"
+    slack_otp.SLACK_WEBHOOK_URL = None
+    slack_otp.requests.post = lambda url, **kwargs: _FakeResponse({"ok": True, "ts": "1111.2222"})
+    try:
+        ts = slack_otp.post_slack_alert("test")
+        SLACK_OTP_CHECKS.append((
+            "post_slack_alert with bot token - posts via chat.postMessage, returns ts",
+            ts == "1111.2222",
+        ))
+    finally:
+        slack_otp.requests.post = real_requests_post
+
+    # webhook only - post_slack_alert posts to the webhook URL, returns None
+    slack_otp.SLACK_BOT_TOKEN = None
+    slack_otp.SLACK_CHANNEL_ID = None
+    slack_otp.SLACK_WEBHOOK_URL = "https://hooks.slack.example/fake"
+    slack_otp.requests.post = lambda url, **kwargs: _FakeResponse({})
+    try:
+        ts = slack_otp.post_slack_alert("test")
+        SLACK_OTP_CHECKS.append((
+            "post_slack_alert with webhook only - posts, returns None (no ts to read back with)",
+            ts is None,
+        ))
+    finally:
+        slack_otp.requests.post = real_requests_post
+
+    # neither configured - raises SlackNotConfigured
+    slack_otp.SLACK_BOT_TOKEN = None
+    slack_otp.SLACK_CHANNEL_ID = None
+    slack_otp.SLACK_WEBHOOK_URL = None
+    try:
+        raised = False
+        try:
+            slack_otp.post_slack_alert("test")
+        except SlackNotConfigured:
+            raised = True
+        SLACK_OTP_CHECKS.append((
+            "post_slack_alert with nothing configured - raises SlackNotConfigured",
+            raised,
+        ))
+    finally:
+        pass
+
+    # poll_for_otp_code with bot token - finds a 6-digit code in history
+    slack_otp.SLACK_BOT_TOKEN = "xoxb-fake"
+    slack_otp.SLACK_CHANNEL_ID = "C123"
+    slack_otp.requests.get = lambda url, **kwargs: _FakeResponse(
+        {"ok": True, "messages": [{"ts": "2222.3333", "text": "OTP: 654321"}]}
+    )
+    slack_otp.time.sleep = lambda seconds: None
+    try:
+        code = slack_otp.poll_for_otp_code("1111.2222", timeout_seconds=5.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code with bot token - finds the 6-digit code in a reply",
+            code == "654321",
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+
+    # THE live bug: the phone's Shortcut fires the instant the SMS
+    # lands, so the code is routinely posted BEFORE the script has
+    # detected the OTP screen and alerted. A code older than after_ts
+    # but inside OTP_LOOKBACK_SECONDS must still be found - under the
+    # original "strictly after the alert" filter this returned None.
+    alert_ts = "2000.0000"
+    code_before_alert_ts = str(float(alert_ts) - 60.0)  # 60s before the alert
+    slack_otp.requests.get = lambda url, **kwargs: _FakeResponse(
+        {"ok": True, "messages": [{"ts": code_before_alert_ts, "text": "384496"}]}
+    )
+    try:
+        code = slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=5.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code - code posted BEFORE the alert but within the "
+            "lookback window is still found (the live race)",
+            code == "384496",
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+
+    # The self-match trap the lookback window exposes: the alert itself
+    # is now INSIDE the window, and a full isoformat() timestamp ends
+    # in exactly six digits of microseconds. It must never be read back
+    # as the code - it's skipped by ts.
+    slack_otp.requests.get = lambda url, **kwargs: _FakeResponse(
+        {"ok": True, "messages": [
+            {"ts": alert_ts,
+             "text": "Sahl bill-pay run needs an OTP code to continue "
+                     "(detected at 2026-09-20T14:28:13.796712)."},
+        ]}
+    )
+    try:
+        code = slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=2.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code - never reads its OWN alert's microseconds "
+            "(796712) back as the OTP code",
+            code is None,
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+
+    # More than one code in the backwards window (e.g. a stale one from
+    # a previous attempt): the NEWEST wins, regardless of the order
+    # Slack returns them in - so this deliberately lists the stale one
+    # first rather than relying on Slack's own ordering.
+    slack_otp.requests.get = lambda url, **kwargs: _FakeResponse(
+        {"ok": True, "messages": [
+            {"ts": str(float(alert_ts) - 90.0), "text": "111111"},   # stale
+            {"ts": str(float(alert_ts) - 10.0), "text": "222222"},   # newest
+            {"ts": str(float(alert_ts) - 50.0), "text": "333333"},
+        ]}
+    )
+    try:
+        code = slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=5.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code - with several codes in the window, the NEWEST wins",
+            code == "222222",
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+
+    # The window itself: the outgoing `oldest` param must actually be
+    # rolled back by OTP_LOOKBACK_SECONDS, so the window can't silently
+    # regress to "after the alert only" without a test noticing.
+    captured_params = {}
+
+    def _capture_get(url, **kwargs):
+        captured_params.update(kwargs.get("params", {}))
+        return _FakeResponse({"ok": True, "messages": []})
+
+    slack_otp.requests.get = _capture_get
+    try:
+        slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=1.0, poll_interval=1.0)
+        expected_oldest = float(alert_ts) - slack_otp.OTP_LOOKBACK_SECONDS
+        SLACK_OTP_CHECKS.append((
+            f"poll_for_otp_code - queries Slack from alert_ts minus "
+            f"OTP_LOOKBACK_SECONDS ({slack_otp.OTP_LOOKBACK_SECONDS}s), not from alert_ts",
+            float(captured_params.get("oldest", 0)) == expected_oldest,
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+
+    # poll_for_otp_code with webhook only - can't read history, times out to None
+    slack_otp.SLACK_BOT_TOKEN = None
+    slack_otp.SLACK_CHANNEL_ID = None
+    try:
+        code = slack_otp.poll_for_otp_code("1111.2222", timeout_seconds=5.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code with webhook only - can't read replies, returns None",
+            code is None,
+        ))
+    finally:
+        pass
+
+    slack_otp.SLACK_BOT_TOKEN = real_bot_token
+    slack_otp.SLACK_CHANNEL_ID = real_channel_id
+    slack_otp.SLACK_WEBHOOK_URL = real_webhook_url
+    slack_otp.requests.post = real_requests_post
+    slack_otp.requests.get = real_requests_get
+    slack_otp.time.sleep = real_slack_sleep
+
+    for description, passed in SLACK_OTP_CHECKS:
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            failures += 1
+        print(f"{status}  slack_otp: {description}")
 
     # ask_ai_free_choice: verification logic (does it actually refuse a
     # target that isn't really tappable/editable, a value_key that
@@ -705,6 +1100,74 @@ def run():
     finally:
         navigate_bill.SAHL_PASSWORD = real_navigate_bill_password
 
+    # home_tile_tapped regression: the home-screen tile tap must fire
+    # even when session recovery consumes step 1 entirely, pushing the
+    # actual home screen to step 2 or later - confirmed live: a real
+    # run's sign-in recovery ate step 1, the "Internet" tile only
+    # appeared at step 2, and the OLD "step == 1" gate silently never
+    # matched it, falling through to the tier-2 AI fallback for
+    # something that should have been fully deterministic.
+    real_ensure_sahl_open = navigate_bill.ensure_sahl_open
+    real_dump_screen_until_labeled_nb = navigate_bill.dump_screen_until_labeled
+    real_attempt_session_recovery_nb = navigate_bill.attempt_session_recovery
+    real_attempt_otp_recovery_nb = navigate_bill.attempt_otp_recovery
+    real_safe_tap_nb = navigate_bill.safe_tap
+    real_classify_nb = navigate_bill.classify_screen_and_pick_action
+    real_navigate_bill_sleep = navigate_bill.time.sleep
+
+    home_tile_call_log = []
+    # step 1's dump: the sign-in screen (recovery consumes this step
+    # entirely). step 2's dump: the home screen with the tile - only
+    # appears AFTER the sign-in step, same ordering as the real bug.
+    fake_screens = [
+        ("xml1", [{"label": SIGN_IN_SCREEN_MARKER, "clickable": False,
+                   "class": "android.view.View", "nearby_label": None,
+                   "bounds": "[0,0][10,10]", "is_password": False}]),
+        ("xml2", [{"label": "Internet", "clickable": True,
+                   "class": "android.view.View", "nearby_label": None,
+                   "bounds": "[0,0][10,10]", "is_password": False}]),
+    ]
+    fake_screen_index = {"i": 0}
+
+    def _fake_dump_screen_until_labeled():
+        idx = min(fake_screen_index["i"], len(fake_screens) - 1)
+        fake_screen_index["i"] += 1
+        return fake_screens[idx]
+
+    navigate_bill.ensure_sahl_open = lambda: True
+    navigate_bill.dump_screen_until_labeled = _fake_dump_screen_until_labeled
+    navigate_bill.attempt_session_recovery = lambda all_labels, sign_in_state: (
+        home_tile_call_log.append("recovery_check") or SIGN_IN_SCREEN_MARKER in all_labels
+    )
+    navigate_bill.attempt_otp_recovery = lambda all_labels: False
+    navigate_bill.safe_tap = lambda label, xml_path=None: home_tile_call_log.append(f"tap:{label}")
+    navigate_bill.classify_screen_and_pick_action = lambda *a, **k: (
+        home_tile_call_log.append("AI_FALLBACK_TIER2")
+        or {"screen_type": "unknown", "action": None}
+    )
+    navigate_bill.time.sleep = lambda seconds: None
+
+    try:
+        navigate_pay_bill(
+            service_tile_label="Internet", operator="WE", account_number="0225305397",
+            max_steps=2,
+        )
+        passed = "tap:Internet" in home_tile_call_log and "AI_FALLBACK_TIER2" not in home_tile_call_log
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            failures += 1
+        print(f"{status}  navigate_pay_bill: home-tile tap still fires when session "
+              f"recovery consumes step 1 (doesn't fall through to the AI fallback)")
+        print(f"      call log: {home_tile_call_log!r}")
+    finally:
+        navigate_bill.ensure_sahl_open = real_ensure_sahl_open
+        navigate_bill.dump_screen_until_labeled = real_dump_screen_until_labeled_nb
+        navigate_bill.attempt_session_recovery = real_attempt_session_recovery_nb
+        navigate_bill.attempt_otp_recovery = real_attempt_otp_recovery_nb
+        navigate_bill.safe_tap = real_safe_tap_nb
+        navigate_bill.classify_screen_and_pick_action = real_classify_nb
+        navigate_bill.time.sleep = real_navigate_bill_sleep
+
     for description, label, expected_allowed in SESSION_EXPIRED_CASES:
         allowed, reason = check_session_expired_tap_allowed(label)
         status = "PASS" if allowed == expected_allowed else "FAIL"
@@ -716,8 +1179,13 @@ def run():
     total = (len(CASES) + len(AMBIGUOUS_CASES) + len(SESSION_EXPIRED_CASES)
               + len(checks) + len(ADB_FAILURE_CASES) + len(STABILITY_CASES)
               + len(FEE_SUMMARY_CASES) + len(RECOVERY_CHECKS)
+              + len(OTP_RECOVERY_CHECKS) + len(SLACK_OTP_CHECKS)
               + len(FREE_CHOICE_AI_CASES) + len(FREE_CHOICE_TAP_CASES)
-              + len(ACCOUNT_NUMBER_FIX_CASES) + 1)
+              + len(ACCOUNT_NUMBER_FIX_CASES)
+              + 1  # known_values/SAHL_PASSWORD guard
+              + 1  # run_adb transient-failure recovery
+              + 1  # home_tile_tapped regression
+              + 1)  # countdown label vs. stability detection
     print(f"\n{total - failures}/{total} passed")
     return failures == 0
 

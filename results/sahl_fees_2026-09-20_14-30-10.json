@@ -1,0 +1,26 @@
+{
+  "collected_at": "2026-09-20T14:30:10.792286",
+  "service_tile_label": "Internet",
+  "operator": "WE",
+  "account_number": "0225305397",
+  "results": [
+    {
+      "Amount Requested": "100 EGP",
+      "Service Value": "100 EGP",
+      "Service Fees": "8 EGP",
+      "Total Amount": "108 EGP"
+    },
+    {
+      "Amount Requested": "300 EGP",
+      "Service Value": "300 EGP",
+      "Service Fees": "11 EGP",
+      "Total Amount": "311 EGP"
+    },
+    {
+      "Amount Requested": "500 EGP",
+      "Service Value": "500 EGP",
+      "Service Fees": "21.25 EGP",
+      "Total Amount": "521.25 EGP"
+    }
+  ]
+}
