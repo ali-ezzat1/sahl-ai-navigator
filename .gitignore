@@ -3,3 +3,4 @@ __pycache__/
 logs/
 debug/
 window_dump.xml
+.venv/

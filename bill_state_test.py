@@ -627,13 +627,25 @@ def run():
          "nearby_label": "Enter the 6 Digit Code", "bounds": "[173,722][908,827]", "is_password": False},
     ]
 
-    def _install_otp_mocks(alert_ts="1234.5678", code="123456", fill_result=True):
+    # What the screen shows once Sahl has left the OTP screen.
+    HOME_ELEMENTS = [
+        {"label": "Internet", "clickable": True, "class": "android.view.View",
+         "nearby_label": None, "bounds": "[60,1400][520,1700]", "is_password": False},
+    ]
+
+    def _install_otp_mocks(alert_ts="1234.5678", code="123456", fill_result=True, screens=None):
+        """screens: what successive dumps return, in order; the last one
+        repeats once the list runs out. Defaults to the OTP screen forever."""
         call_log = []
+        screens = list(screens or [OTP_FIELD_ELEMENTS])
+
+        def _dump():
+            call_log.append("dump")
+            return "fake_xml_path", (screens.pop(0) if len(screens) > 1 else screens[0])
+
         navigate_bill.post_slack_alert = lambda text: call_log.append(f"alert:{text!r}") or alert_ts
         navigate_bill.poll_for_otp_code = lambda ts: call_log.append(f"poll:{ts!r}") or code
-        navigate_bill.dump_screen_until_labeled = lambda: (
-            call_log.append("dump") or ("fake_xml_path", OTP_FIELD_ELEMENTS)
-        )
+        navigate_bill.dump_screen_until_labeled = _dump
         navigate_bill.clear_and_type_field = lambda text, xml_path=None: (
             call_log.append(f"type:{text!r}") or fill_result
         )
@@ -698,15 +710,47 @@ def run():
     finally:
         _restore_otp_mocks()
 
-    # 4. full happy path - alert, poll, type the code, dismiss keyboard, tap Verify
-    call_log = _install_otp_mocks(alert_ts="1234.5678", code="123456")
+    # 4. full happy path - alert, poll, type the code, dismiss keyboard, tap
+    # Verify, then wait until the OTP screen is actually gone
+    call_log = _install_otp_mocks(
+        alert_ts="1234.5678", code="123456", screens=[OTP_FIELD_ELEMENTS, HOME_ELEMENTS],
+    )
     try:
         result = attempt_otp_recovery([OTP_SCREEN_MARKER])
         OTP_RECOVERY_CHECKS.append((
-            "OTP screen, code arrives from Slack - types it and taps Verify",
+            "OTP screen, code arrives from Slack - types it, taps Verify, waits for the screen to change",
             result is True and call_log[0].startswith("alert:") and call_log[1:] == [
-                "poll:'1234.5678'", "dump", "type:'123456'", "dismiss_keyboard", "tap:Verify",
+                "poll:'1234.5678'", "dump", "type:'123456'", "dismiss_keyboard", "tap:Verify", "dump",
             ],
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    # 5. the live failure: by the time a code came back from Slack, Sahl had
+    # already accepted the previous Verify and left the OTP screen - must
+    # carry on, not raise "expected exactly one OTP EditText field, found 0"
+    call_log = _install_otp_mocks(screens=[HOME_ELEMENTS])
+    try:
+        result = attempt_otp_recovery([OTP_SCREEN_MARKER])
+        OTP_RECOVERY_CHECKS.append((
+            "OTP screen gone before typing (late Verify accepted) - returns True, types and taps nothing",
+            result is True and not any(
+                entry.startswith(("type:", "tap:")) for entry in call_log
+            ),
+        ))
+    finally:
+        _restore_otp_mocks()
+
+    # 6. still on the OTP screen after Verify (code rejected) - waits the
+    # full settle window once, never types a second code itself
+    call_log = _install_otp_mocks(screens=[OTP_FIELD_ELEMENTS])
+    try:
+        result = attempt_otp_recovery([OTP_SCREEN_MARKER])
+        OTP_RECOVERY_CHECKS.append((
+            "OTP screen still showing after Verify - waits the settle window, types only once",
+            result is True
+            and call_log.count("dump") == 1 + navigate_bill.OTP_VERIFY_SETTLE_CHECKS
+            and sum(entry.startswith("type:") for entry in call_log) == 1,
         ))
     finally:
         _restore_otp_mocks()
@@ -861,6 +905,23 @@ def run():
         ))
     finally:
         slack_otp.requests.get = real_requests_get
+
+    # The live bug: a second OTP check in the same run must not get the
+    # first, already-used code back from inside the lookback window.
+    used_ts = str(float(alert_ts) - 5.0)
+    slack_otp.requests.get = lambda url, **kwargs: _FakeResponse(
+        {"ok": True, "messages": [{"ts": used_ts, "text": "433883"}]}
+    )
+    try:
+        first = slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=2.0, poll_interval=1.0)
+        second = slack_otp.poll_for_otp_code(alert_ts, timeout_seconds=2.0, poll_interval=1.0)
+        SLACK_OTP_CHECKS.append((
+            "poll_for_otp_code - never hands out the same Slack message's code twice",
+            first == "433883" and second is None,
+        ))
+    finally:
+        slack_otp.requests.get = real_requests_get
+        slack_otp._USED_CODE_TS.discard(used_ts)
 
     # The window itself: the outgoing `oldest` param must actually be
     # rolled back by OTP_LOOKBACK_SECONDS, so the window can't silently

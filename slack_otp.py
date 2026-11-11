@@ -59,6 +59,11 @@ OTP_CODE_PATTERN = re.compile(r"\b(\d{6})\b")
 # a code too old for this window is too old to work anyway.
 OTP_LOOKBACK_SECONDS = 120.0
 
+# Slack message timestamps whose code poll_for_otp_code has already
+# returned in this process - never handed out twice. See that
+# function's docstring for the live run that needed this.
+_USED_CODE_TS: set[str] = set()
+
 
 class SlackNotConfigured(Exception):
     """Raised when neither a bot token nor a webhook URL is set in .env
@@ -124,12 +129,13 @@ def poll_for_otp_code(
       so the NEWEST match wins rather than the first one Slack happens
       to return.
 
-    Known limitation: if the flow hits the OTP screen twice within
-    OTP_LOOKBACK_SECONDS, a poll can still re-find the first
-    (already-used) code when the replacement hasn't been posted yet.
-    Taking the newest match covers the common case; a full guard
-    (remembering codes already typed this run) was deliberately
-    deferred as speculative.
+    - A code is handed out at most once per process: every message a
+      poll returns is remembered in _USED_CODE_TS and skipped by later
+      polls. Confirmed live: the bill flow tapped Verify, re-checked
+      the screen before Sahl had left the OTP screen, polled again and
+      got the SAME (already-used) code back from inside the lookback
+      window. With the guard, a second OTP screen waits for a genuinely
+      new code instead.
 
     Requires SLACK_BOT_TOKEN + SLACK_CHANNEL_ID - a webhook alone can
     only post, never read a channel's history, so this always returns
@@ -169,6 +175,8 @@ def poll_for_otp_code(
             for message in payload.get("messages", []):
                 if after_ts is not None and message.get("ts") == after_ts:
                     continue
+                if message.get("ts") in _USED_CODE_TS:
+                    continue
                 match = OTP_CODE_PATTERN.search(message.get("text", ""))
                 if not match:
                     continue
@@ -177,6 +185,7 @@ def poll_for_otp_code(
 
             if newest_code is not None:
                 print(f"Found an OTP code in Slack (message ts={newest_ts}).")
+                _USED_CODE_TS.add(newest_ts)
                 return newest_code
 
         time.sleep(poll_interval)

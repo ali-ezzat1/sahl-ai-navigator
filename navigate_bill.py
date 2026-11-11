@@ -40,16 +40,18 @@ tile label + operator/company names to guardrail.ALLOWED_LABELS only
 once you've seen them for real.
 """
 
+import argparse
 import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 
 from dotenv import load_dotenv
 
 from dump_screen import dump_screen_until_labeled, AdbConnectionError
-from launch_sahl import ensure_sahl_open
+from launch_sahl import ensure_sahl_open, reset_to_launcher
 from tap import (
     safe_tap,
     safe_tap_recovery,
@@ -63,7 +65,7 @@ from tap import (
     dismiss_keyboard,
     clear_and_type_field,
 )
-from navigate import extract_fee_summary, SIGN_IN_SCREEN_MARKER
+from navigate import extract_fee_summary, navigate, SIGN_IN_SCREEN_MARKER
 from ai_pick import suggest_relabel, classify_screen_and_pick_action, ask_ai_free_choice
 from guardrail import ALLOWED_LABELS, ACTION_SYNONYMS, SESSION_EXPIRED_MARKER_TEXT, OTP_SCREEN_MARKER
 from slack_otp import post_slack_alert, poll_for_otp_code, SlackNotConfigured
@@ -289,6 +291,11 @@ def attempt_session_recovery(all_labels: list[str], sign_in_state: dict) -> bool
     return True
 
 
+# How many 2-second checks attempt_otp_recovery makes after tapping Verify
+# while waiting for Sahl to leave the OTP screen (20s in total).
+OTP_VERIFY_SETTLE_CHECKS = 10
+
+
 class OtpRecoveryFailed(Exception):
     """Raised by attempt_otp_recovery when the OTP screen could not be
     cleared - Slack isn't configured (see slack_otp.SlackNotConfigured),
@@ -337,6 +344,12 @@ def attempt_otp_recovery(all_labels: list[str]) -> bool:
         raise OtpRecoveryFailed("no OTP code arrived from Slack within the poll timeout")
 
     xml_path, elements = dump_screen_until_labeled()
+    if OTP_SCREEN_MARKER not in _labels(elements):
+        # The screen moved on while we were waiting on Slack - most often
+        # a Verify from a moment ago being accepted late. Nothing left to
+        # type into; let the caller re-check from the top.
+        print("The OTP screen is gone already - continuing without typing a code.")
+        return True
     fields = [e for e in elements if e["class"] == "android.widget.EditText"]
     if len(fields) != 1:
         raise OtpRecoveryFailed(
@@ -352,7 +365,18 @@ def attempt_otp_recovery(all_labels: list[str]) -> bool:
     time.sleep(0.5)
     print("Tapping Verify.")
     safe_tap("Verify")
-    time.sleep(2.0)
+
+    # Wait for Sahl to actually leave the OTP screen before handing back.
+    # Confirmed live: a fixed 2s wait re-checked while verification was
+    # still in flight, saw the OTP screen again, and tried a second code.
+    for _ in range(OTP_VERIFY_SETTLE_CHECKS):
+        time.sleep(2.0)
+        _, elements = dump_screen_until_labeled()
+        if OTP_SCREEN_MARKER not in _labels(elements):
+            print("OTP accepted - the verification screen is gone.")
+            return True
+    print(f"Still on the OTP screen {2 * OTP_VERIFY_SETTLE_CHECKS}s after Verify - "
+          f"the code may have been rejected. Re-checking from the top.")
     return True
 
 
@@ -778,18 +802,20 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
 
 def save_results(results, service_tile_label: str, operator: str, account_number: str) -> str:
-    """Writes one run's results to results/sahl_fees_<timestamp>.json -
-    same directory and "collected_at" + "results" shape as the old
-    (deleted) run_all_operators.py's save_results(), so a GitHub
-    Actions workflow uploading results/*.json as an artifact actually
-    has something to find. Unlike that old multi-operator sweep script,
-    `results` here is just whatever this one call to
+    """Writes one service's results to
+    results/sahl_fees_<timestamp>_<service>.json - same "collected_at" +
+    "results" shape as every earlier file, one file per service per run,
+    so files from before the daily run covered several services still
+    read the same way. `results` is just whatever this one call to
     navigate_pay_bill()/navigate() returned - not nested per operator.
     Returns the path written."""
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     now = datetime.now()
-    path = os.path.join(RESULTS_DIR, f"sahl_fees_{now.strftime('%Y-%m-%d_%H-%M-%S')}.json")
+    path = os.path.join(
+        RESULTS_DIR,
+        f"sahl_fees_{now.strftime('%Y-%m-%d_%H-%M-%S')}_{service_tile_label.lower()}.json",
+    )
     payload = {
         "collected_at": now.isoformat(),
         "service_tile_label": service_tile_label,
@@ -802,37 +828,133 @@ def save_results(results, service_tile_label: str, operator: str, account_number
     return path
 
 
-if __name__ == "__main__":
-    # AdbConnectionError propagates up through collect_bill_fee_tiers()
-    # (called from inside navigate_pay_bill's own call stack) as well as
-    # navigate_pay_bill() itself, so this one wrap covers both without
-    # needing a separate try/except inside either function.
-    # Defaults match the values verified by hand; a GitHub Actions
-    # workflow_dispatch run can override any of these via env vars set
-    # from its own inputs, without changing the defaults for a plain
-    # local `python navigate_bill.py` run.
-    SERVICE_TILE_LABEL = os.environ.get("BILL_SERVICE_TILE_LABEL", "Internet")
-    OPERATOR = os.environ.get("BILL_OPERATOR", "WE")
-    TEST_ACCOUNT_NUMBER = os.environ.get("BILL_ACCOUNT_NUMBER", "0225305397")
-    try:
-        results = navigate_pay_bill(
-            service_tile_label=SERVICE_TILE_LABEL, operator=OPERATOR, account_number=TEST_ACCOUNT_NUMBER,
-        )
-    except AdbConnectionError as e:
-        print(f"\nadb connection lost - stopping this run. ({e})")
-        print("(Future: automatic emulator recovery goes here.)")
-        results = None
+ALL_SERVICES = ("Internet", "Landline", "Mobile")
 
-    print(f"\n=== Final Results ({SERVICE_TILE_LABEL}, Pay Bill, {OPERATOR}) ===")
-    if isinstance(results, list):
-        for row in results:
-            print(row)
-        saved_path = save_results(results, SERVICE_TILE_LABEL, OPERATOR, TEST_ACCOUNT_NUMBER)
-        print(f"Saved to {saved_path}")
-    elif isinstance(results, dict):
-        print(results)
-        saved_path = save_results(results, SERVICE_TILE_LABEL, OPERATOR, TEST_ACCOUNT_NUMBER)
-        print(f"Saved to {saved_path}")
-    else:
-        print("No results - navigation did not complete successfully.")
+
+def daily_services() -> list[dict]:
+    """The services one run covers, in order. Defaults match the values
+    verified by hand; each can be overridden from .env without touching
+    the code. SAHL_SERVICES picks a subset, e.g. "Internet,Mobile".
+
+    Landline defaults to the Internet account number because WE's home
+    internet is billed against the landline number - set
+    LANDLINE_ACCOUNT_NUMBER if yours differs."""
+
+    internet_account = os.environ.get("BILL_ACCOUNT_NUMBER", "0225305397")
+    services = {
+        "Internet": {
+            "service": "Internet", "flow": "Pay Bill",
+            "operator": os.environ.get("BILL_OPERATOR", "WE"),
+            "number": internet_account,
+        },
+        "Landline": {
+            "service": "Landline", "flow": "Pay Bill",
+            "operator": os.environ.get("LANDLINE_OPERATOR", "WE"),
+            "number": os.environ.get("LANDLINE_ACCOUNT_NUMBER", internet_account),
+        },
+        "Mobile": {
+            "service": "Mobile", "flow": "Top-Up",
+            "operator": os.environ.get("MOBILE_OPERATOR", "Vodafone"),
+            "number": os.environ.get("MOBILE_PHONE_NUMBER", "01111198404"),
+        },
+    }
+    wanted = os.environ.get("SAHL_SERVICES", ",".join(ALL_SERVICES))
+    names = [name.strip() for name in wanted.split(",") if name.strip()]
+    unknown = [name for name in names if name not in services]
+    if unknown:
+        raise SystemExit(f"Unknown SAHL_SERVICES entries {unknown} - choose from {list(ALL_SERVICES)}")
+    return [services[name] for name in names]
+
+
+def run_service(spec: dict):
+    """Runs one service's flow from a clean start and returns its rows
+    (list or dict), or None if it didn't reach the fee screen."""
+
+    reset_to_launcher()
+    if spec["flow"] == "Top-Up":
+        goal = (
+            f"Navigate to the Mobile Top-Up flow for the {spec['operator']} operator, "
+            "so we can see the Service Fees for a top-up."
+        )
+        return navigate(goal, phone_number=spec["number"])
+    return navigate_pay_bill(
+        service_tile_label=spec["service"], operator=spec["operator"], account_number=spec["number"],
+    )
+
+
+def format_rows(results) -> list[str]:
+    rows = results if isinstance(results, list) else [results]
+    lines = []
+    for row in rows:
+        amount = row.get("Amount Requested") or row.get("Balance Requested") or "?"
+        lines.append(f"    {amount}: fee {row.get('Service Fees', '?')}, total {row.get('Total Amount', '?')}")
+    return lines
+
+
+def build_summary(outcomes: list[dict]) -> str:
+    """One Slack message covering every service in this run - a line per
+    service saying whether it worked, then its fee rows."""
+
+    lines = [f"Sahl fees {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+    for outcome in outcomes:
+        spec = outcome["spec"]
+        label = f"{spec['service']} / {spec['operator']}"
+        if outcome["results"]:
+            lines.append(f"✅ {label}")
+            lines.extend(format_rows(outcome["results"]))
+        else:
+            lines.append(f"❌ {label}: no results ({outcome['error'] or 'did not reach the fee screen'})")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect Sahl service fees for every configured service.")
+    parser.add_argument(
+        "--slack-summary", action="store_true",
+        help="post one summary of every service to Slack at the end (the daily cloud run sets this)",
+    )
+    args = parser.parse_args()
+
+    outcomes = []
+    adb_lost = False
+    for spec in daily_services():
+        print(f"\n\n========== {spec['service']} ({spec['flow']}, {spec['operator']}) ==========")
+        outcome = {"spec": spec, "results": None, "error": None}
+        if adb_lost:
+            outcome["error"] = "skipped - adb connection was lost earlier in this run"
+            outcomes.append(outcome)
+            continue
+        try:
+            outcome["results"] = run_service(spec) or None
+        except AdbConnectionError as e:
+            # The emulator itself is gone - every later service would fail
+            # the same way, so record them as skipped instead of retrying.
+            print(f"\nadb connection lost - stopping this run. ({e})")
+            outcome["error"] = "adb connection lost"
+            adb_lost = True
+        except Exception as e:
+            # One service breaking (a changed screen, an AI hiccup) must not
+            # cost the others their data - log it and move on.
+            traceback.print_exc()
+            outcome["error"] = f"{type(e).__name__}: {e}"
+
+        if outcome["results"]:
+            print(f"\n=== Final Results ({spec['service']}, {spec['flow']}, {spec['operator']}) ===")
+            for line in format_rows(outcome["results"]):
+                print(line.strip())
+            saved_path = save_results(outcome["results"], spec["service"], spec["operator"], spec["number"])
+            print(f"Saved to {saved_path}")
+        else:
+            print(f"No results for {spec['service']} - {outcome['error'] or 'did not reach the fee screen'}.")
+        outcomes.append(outcome)
+
+    summary = build_summary(outcomes)
+    print("\n\n" + summary)
+    if args.slack_summary:
+        try:
+            post_slack_alert(summary)
+        except Exception as e:
+            print(f"Could not post the Slack summary ({type(e).__name__}: {e}) - results are still saved.")
+
+    if not all(outcome["results"] for outcome in outcomes):
         sys.exit(1)

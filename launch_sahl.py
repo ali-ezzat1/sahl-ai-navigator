@@ -9,11 +9,12 @@ assumption true.
 
 import time
 
-from dump_screen import dump_screen_until_labeled, get_foreground_package
+from dump_screen import dump_screen_until_labeled, get_foreground_package, run_adb
 from guardrail import ALLOWED_LABELS
 from tap import safe_tap_by_prefix, swipe_up
 
 LAUNCHER_PACKAGE = "com.google.android.apps.nexuslauncher"
+SAHL_PACKAGE = "gtpay.gtronicspay.com"
 SAHL_APP_LABEL = "Sahl"
 MAX_LAUNCH_ATTEMPTS = 5
 
@@ -61,6 +62,20 @@ def ensure_sahl_open(max_attempts: int = MAX_LAUNCH_ATTEMPTS) -> bool:
 
     print(f"Still on the launcher after {max_attempts} attempts - stopping rather than guessing.")
     return False
+
+
+def reset_to_launcher() -> None:
+    """Force-stops Sahl and returns to the Android home screen, so the
+    next flow starts from Sahl's own home screen instead of wherever the
+    previous flow left off (e.g. a fee screen) - ensure_sahl_open() only
+    knows how to start from the launcher. Force-stop ends the process
+    but keeps the app's stored data, so the login survives it; a sign-in
+    screen on relaunch is the same case a fresh emulator boot already
+    hits, and each flow handles it the same way."""
+
+    run_adb("shell", "am", "force-stop", SAHL_PACKAGE)
+    run_adb("shell", "input", "keyevent", "3")  # KEYCODE_HOME
+    time.sleep(2.0)
 
 
 if __name__ == "__main__":
